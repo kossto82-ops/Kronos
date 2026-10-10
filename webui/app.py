@@ -9,6 +9,7 @@ from flask_cors import CORS
 import sys
 import warnings
 import datetime
+import requests
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
@@ -23,6 +24,15 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
+
+@app.after_request
+def add_no_cache(response):
+    """Prevent browsers from caching the HTML so UI changes show immediately"""
+    if 'text/html' in response.headers.get('Content-Type', ''):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 # Global variables to store models
 tokenizer = None
@@ -121,6 +131,215 @@ def load_data_file(file_path):
         
     except Exception as e:
         return None, f"Failed to load file: {str(e)}"
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+
+OKX_BAR = {"1d": "1D", "1h": "1H", "5m": "5m", "15m": "15m", "4h": "4H"}
+US_PERIOD_BY_INTERVAL = {"1d": "3y", "1h": "730d", "5m": "60d", "15m": "60d", "30m": "60d"}
+
+PRESET_TICKERS = {
+    'ai': [
+        'NVDA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AAPL', 'ORCL', 'PLTR',
+        'CRM', 'SNOW', 'IBM', 'NOW', 'AMD', 'AVGO', 'MRVL'
+    ],
+    'chips': [
+        'NVDA', 'AMD', 'INTC', 'TSM', 'AVGO', 'QCOM', 'TXN', 'MU', 'AMAT',
+        'LRCX', 'ASML', 'ADI', 'NXPI', 'MRVL', 'ON', 'KLAC', 'ARM', 'SMCI'
+    ],
+    'quantum': [
+        'IONQ', 'RGTI', 'QBTS', 'QUBT', 'ARQQ', 'IBM', 'GOOGL', 'MSFT', 'HON'
+    ],
+}
+
+
+def _fetch_crypto_binance(symbol, interval, limit):
+    r = requests.get(
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    rows = []
+    for k in r.json():
+        rows.append({
+            "timestamps": pd.to_datetime(k[0], unit="ms"),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+            "amount": float(k[7]),
+        })
+    return pd.DataFrame(rows)
+
+
+def _fetch_crypto_okx(symbol, interval, limit):
+    inst = symbol.upper().replace("USDT", "-USDT")
+    r = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": inst, "bar": OKX_BAR.get(interval, interval), "limit": limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    rows = []
+    for k in reversed(r.json().get("data", [])):
+        vol = float(k[5])
+        close = float(k[4])
+        rows.append({
+            "timestamps": pd.to_datetime(int(k[0]), unit="ms"),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": close,
+            "volume": vol,
+            "amount": vol * close,
+        })
+    return pd.DataFrame(rows)
+
+
+def fetch_live_data(source, symbol, interval="1d", limit=1000, period=None):
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        raise ValueError("Symbol cannot be empty")
+
+    if source == "crypto":
+        try:
+            return _fetch_crypto_binance(symbol, interval, limit)
+        except Exception:
+            return _fetch_crypto_okx(symbol, interval, limit)
+
+    if source == "us":
+        import yfinance as yf
+        period = period or US_PERIOD_BY_INTERVAL.get(interval, "2y")
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            raise RuntimeError(f"yfinance returned no data for {symbol}")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+        ts_col = "Datetime" if "Datetime" in df.columns else "Date"
+        return pd.DataFrame({
+            "timestamps": pd.to_datetime(df[ts_col]),
+            "open": df["Open"].astype(float),
+            "high": df["High"].astype(float),
+            "low": df["Low"].astype(float),
+            "close": df["Close"].astype(float),
+            "volume": df["Volume"].astype(float),
+            "amount": df["Close"].astype(float) * df["Volume"].astype(float),
+        })
+
+    raise ValueError(f"Unsupported source: {source}")
+
+
+def preset_union(name):
+    """Return tickers for a sector preset, or the union of all sectors for 'all'"""
+    if name == 'all':
+        seen = []
+        for key in ('ai', 'chips', 'quantum'):
+            for ticker in PRESET_TICKERS[key]:
+                if ticker not in seen:
+                    seen.append(ticker)
+        return seen
+    return list(PRESET_TICKERS.get(name, []))
+
+
+@app.route('/api/fetch-data', methods=['POST'])
+def fetch_data():
+    """Download fresh market data and save it into the data directory"""
+    try:
+        payload = request.get_json() or {}
+        source = payload.get('source', 'crypto')
+        symbol = payload.get('symbol', '')
+        interval = payload.get('interval', '1d')
+        limit = int(payload.get('limit', 1000))
+        preset = payload.get('preset') or payload.get('sector')
+
+        if source == 'us' and preset:
+            tickers = preset_union(preset)
+            if not tickers:
+                return jsonify({'error': f'Unknown preset: {preset}'}), 400
+            files = []
+            errors = []
+            for ticker in tickers:
+                try:
+                    df = fetch_live_data(source, ticker, interval=interval)
+                    df = df.dropna().reset_index(drop=True)
+                    if df.empty:
+                        errors.append(f"{ticker}: no data")
+                        continue
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    file_name = f"{ticker}_{source}_{interval}.csv"
+                    df.to_csv(os.path.join(DATA_DIR, file_name), index=False)
+                    warning = None
+                    if len(df) < 520:
+                        warning = f"Only {len(df)} rows (< 520 needed for a full prediction window)"
+                    files.append({
+                        'file_name': file_name,
+                        'file_path': os.path.join(DATA_DIR, file_name),
+                        'rows': len(df),
+                        'start': str(df['timestamps'].iloc[0]),
+                        'end': str(df['timestamps'].iloc[-1]),
+                        'warning': warning,
+                    })
+                    print(f"[fetch-data] Saved {file_name} ({len(df)} rows)")
+                except Exception as e:
+                    errors.append(f"{ticker}: {str(e)}")
+                    print(f"[fetch-data] {ticker} failed: {e}")
+
+            if not files:
+                return jsonify({'error': f'All {len(tickers)} tickers failed: ' + '; '.join(errors[:5])}), 502
+
+            detail = f"Downloaded {len(files)}/{len(tickers)} files for preset '{preset}'"
+            if errors:
+                detail += f" ({len(errors)} failed: " + '; '.join(errors[:5]) + ')'
+            return jsonify({
+                'success': True,
+                'message': detail,
+                'files': files,
+                'errors': errors,
+            })
+
+        if not symbol:
+            return jsonify({'error': 'Enter a symbol (or select a sector preset)'}), 400
+
+        df = fetch_live_data(source, symbol, interval=interval, limit=limit)
+        df = df.dropna().reset_index(drop=True)
+        if df.empty:
+            return jsonify({'error': 'No data returned for the requested symbol'}), 400
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        file_name = f"{symbol.strip().upper()}_{source}_{interval}.csv"
+        file_path = os.path.join(DATA_DIR, file_name)
+        df.to_csv(file_path, index=False)
+        warning = None
+        if len(df) < 520:
+            warning = f"Only {len(df)} rows (< 520 needed for a full prediction window)"
+
+        return jsonify({
+            'success': True,
+            'file_name': file_name,
+            'file_path': file_path,
+            'rows': len(df),
+            'start': str(df['timestamps'].iloc[0]),
+            'end': str(df['timestamps'].iloc[-1]),
+            'warning': warning,
+            'files': [{
+                'file_name': file_name,
+                'file_path': file_path,
+                'rows': len(df),
+                'start': str(df['timestamps'].iloc[0]),
+                'end': str(df['timestamps'].iloc[-1]),
+                'warning': warning,
+            }],
+            'errors': [],
+            'message': f'Downloaded {len(df)} candles for {symbol.upper()} ({interval}) -> {file_name}'
+        })
+
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': f'Network error while downloading data: {str(e)}'}), 502
+    except Exception as e:
+        return jsonify({'error': f'Failed to download data: {str(e)}'}), 500
+
 
 def save_prediction_results(file_path, prediction_type, prediction_results, actual_data, input_data, prediction_params):
     """Save prediction results to file"""
@@ -327,6 +546,32 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
     
     return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
 
+def create_overview_chart(df, max_points=600):
+    """Create a candlestick preview chart for the loaded data"""
+    view = df.tail(max_points).reset_index(drop=True)
+    x = view['timestamps'] if 'timestamps' in view.columns else view.index
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=x,
+        open=view['open'],
+        high=view['high'],
+        low=view['low'],
+        close=view['close'],
+        name='OHLC',
+        increasing_line_color='#26A69A',
+        decreasing_line_color='#EF5350'
+    ))
+    fig.update_layout(
+        title=f'Loaded data preview - last {len(view)} of {len(df)} candles',
+        xaxis_title='Time',
+        yaxis_title='Price',
+        template='plotly_white',
+        height=600,
+        showlegend=False,
+        xaxis_rangeslider_visible=False
+    )
+    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
 @app.route('/')
 def index():
     """Home page"""
@@ -395,11 +640,103 @@ def load_data():
         return jsonify({
             'success': True,
             'data_info': data_info,
+            'chart': create_overview_chart(df),
             'message': f'Successfully loaded data, total {len(df)} rows'
         })
         
     except Exception as e:
         return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
+
+def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=None):
+    """Build a plain-language summary about where the prediction goes (up/down/sideways)."""
+    from_price = float(x_df['close'].iloc[-1]) if x_df is not None and len(x_df) > 0 else 0.0
+    pred_closes = [float(r['close']) for r in prediction_results]
+    pred_times = [r['timestamp'] for r in prediction_results]
+
+    if not pred_closes:
+        return {'direction': 'unknown', 'explanation': 'No hay datos de predicción disponibles'}
+
+    window = min(5, len(pred_closes))
+    end_price = float(np.mean(pred_closes[-window:]))
+    change_pct = (end_price - from_price) / from_price * 100.0 if from_price else 0.0
+
+    threshold = 0.15
+    if change_pct > threshold:
+        direction = 'up'
+        direction_label = 'SUBIR'
+    elif change_pct < -threshold:
+        direction = 'down'
+        direction_label = 'BAJAR'
+    else:
+        direction = 'sideways'
+        direction_label = 'LATERAL'
+
+    lo = float(min(pred_closes))
+    hi = float(max(pred_closes))
+    range_pct = (hi - lo) / from_price * 100.0 if from_price else 0.0
+
+    pct_series = []
+    prev = from_price
+    for c in pred_closes:
+        if prev:
+            pct_series.append((c - prev) / prev * 100.0)
+        prev = c
+    daily_vol = float(np.mean([abs(p) for p in pct_series])) if pct_series else 0.0
+
+    fmt = lambda v: f"{v:,.2f}"
+    explanation = (
+        f"Según la predicción, el precio podría {direction_label.lower()} "
+        f"un {abs(change_pct):.2f}% en las próximas {pred_len} velas: "
+        f"de {fmt(from_price)} a {fmt(end_price)} aprox."
+    )
+    details = (
+        f"El rango previsto va de {fmt(lo)} a {fmt(hi)} (±{range_pct:.2f}% del precio de partida), "
+        f"con una variación típica de ±{daily_vol:.2f}% por vela."
+    )
+
+    comparison = None
+    if actual_data and len(actual_data) > 0:
+        actual_closes = [float(a['close']) for a in actual_data]
+        actual_end = actual_closes[-1]
+        actual_change_pct = (actual_end - from_price) / from_price * 100.0 if from_price else 0.0
+        same_dir = (actual_change_pct > 0) == (change_pct > 0)
+        n = min(len(pred_closes), len(actual_closes))
+        mape = sum(abs(p - a) / a * 100.0 for p, a in zip(pred_closes, actual_closes)) / n if n else 0.0
+        if actual_change_pct > 0:
+            real_label = f"subidas de {actual_change_pct:.2f}%"
+        elif actual_change_pct < 0:
+            real_label = f"bajadas de {abs(actual_change_pct):.2f}%"
+        else:
+            real_label = "sin dirección clara"
+        comparison = {
+            'direction_matched': same_dir,
+            'actual_change_pct': actual_change_pct,
+            'mape': mape,
+            'text': (
+                f"En comparación con lo que realmente pasó después: {real_label}, "
+                f"la dirección {'coincide' if same_dir else 'NO coincide'} con la predicción. "
+                f"Error medio por vela: {mape:.2f}%."
+            )
+        }
+
+    return {
+        'direction': direction,
+        'direction_label': direction_label,
+        'from_price': from_price,
+        'end_price': end_price,
+        'change_pct': change_pct,
+        'min_price': lo,
+        'max_price': hi,
+        'range_pct': range_pct,
+        'daily_vol_pct': daily_vol,
+        'pred_len': pred_len,
+        'pred_closes': pred_closes,
+        'pred_times': pred_times,
+        'explanation': explanation,
+        'details': details,
+        'comparison': comparison,
+    }
+
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
@@ -614,6 +951,7 @@ def predict():
             'success': True,
             'prediction_type': prediction_type,
             'chart': chart_json,
+            'summary': build_prediction_summary(prediction_results, x_df, pred_len, actual_data),
             'prediction_results': prediction_results,
             'actual_data': actual_data,
             'has_comparison': len(actual_data) > 0,
@@ -705,4 +1043,4 @@ if __name__ == '__main__':
     else:
         print("Tip: Will use simulated data for demonstration")
     
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    app.run(debug=True, host='0.0.0.0', port=7070, use_reloader=False)

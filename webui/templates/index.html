@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kronos Financial Prediction Web UI</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="/static/plotly.min.js" onerror="this.onerror=null;this.src='https://cdn.plot.ly/plotly-2.35.2.min.js'"></script>
+    <script src="/static/axios.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/axios@1.7.9/dist/axios.min.js'"></script>
     <style>
         * {
             margin: 0;
@@ -302,6 +302,48 @@
         }
 
         /* Comparison analysis styles */
+        .prediction-summary {
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .summary-direction {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .summary-direction.up { color: #16a34a; }
+        .summary-direction.down { color: #dc2626; }
+        .summary-direction.sideways { color: #64748b; }
+        .summary-direction.unknown { color: #4a5568; }
+
+        .summary-explanation {
+            margin: 6px 0;
+            font-size: 15px;
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .summary-details {
+            margin: 6px 0;
+            font-size: 13px;
+            color: #4a5568;
+        }
+
+        .summary-comparison {
+            margin: 10px 0;
+            padding: 10px 14px;
+            border-left: 4px solid #667eea;
+            background: #edf2f7;
+            font-size: 13px;
+        }
+
         .comparison-section {
             background: #f7fafc;
             border: 1px solid #e2e8f0;
@@ -494,6 +536,49 @@
                     📁 Load Data
                 </button>
 
+                <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
+
+                <!-- Download / Update Data -->
+                <div class="form-group">
+                    <label for="fetch-source">⬇️ Download / Update Data</label>
+                    <select id="fetch-source">
+                        <option value="crypto">Crypto (Binance / OKX)</option>
+                        <option value="us">US Stocks (yfinance)</option>
+                    </select>
+                </div>
+
+                <div class="form-group" id="fetch-sector-group" style="display: none;">
+                    <label for="fetch-sector">Sector preset (US):</label>
+                    <select id="fetch-sector">
+                        <option value="">— Manual (symbol below) —</option>
+                        <option value="ai">AI companies</option>
+                        <option value="chips">Chips / Semiconductors</option>
+                        <option value="quantum">Quantum technology</option>
+                        <option value="all">All: AI + Chips + Quantum</option>
+                    </select>
+                    <small class="form-text">Downloads all companies in the selected sector automatically</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="fetch-symbol">Symbol:</label>
+                    <input type="text" id="fetch-symbol" value="BTCUSDT" placeholder="BTCUSDT / ETHUSDT / AAPL / TSLA">
+                    <small class="form-text">Crypto: BTCUSDT, ETHUSDT... | US: AAPL, TSLA, MSFT... (or use a sector preset)</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="fetch-interval">Interval:</label>
+                    <select id="fetch-interval">
+                        <option value="1d">1 day (daily)</option>
+                        <option value="1h">1 hour</option>
+                        <option value="5m">5 minutes</option>
+                    </select>
+                    <small class="form-text">Daily recommended (needs >= 520 candles for a full window)</small>
+                </div>
+
+                <button id="fetch-data-btn" class="btn btn-warning">
+                    ⬇️ Download Data
+                </button>
+
                 <!-- Data Information Display -->
                 <div id="data-info" class="data-info" style="display: none;">
                     <h3>📊 Data Information</h3>
@@ -576,9 +661,18 @@
                 </div>
             </div>
 
-            <div class="chart-container">
-                <h2>📈 Prediction Results Chart</h2>
-                <div id="chart"></div>
+<div class="chart-container">
+<h2>📈 Prediction Results Chart</h2>
+<div id="chart"></div>
+
+<!-- Prediction Summary (plain language) -->
+<div id="prediction-summary" class="prediction-summary" style="display: none;">
+<div id="summary-direction" class="summary-direction">-</div>
+<p id="summary-explanation" class="summary-explanation"></p>
+<p id="summary-details" class="summary-details"></p>
+<div id="prediction-line-chart"></div>
+<div id="summary-comparison" class="summary-comparison"></div>
+</div>
                 
                 <!-- Comparison Analysis -->
                 <div id="comparison-section" class="comparison-section" style="display: none;">
@@ -640,6 +734,97 @@
         let availableModels = [];
         let modelLoaded = false;
 
+        // Render chart with Plotly, falling back to a canvas drawing if Plotly failed to load
+        function renderChart(parsed) {
+            if (typeof Plotly !== 'undefined') {
+                try {
+                    Plotly.newPlot('chart', parsed.data, parsed.layout);
+                    return;
+                } catch (e) {
+                    console.error('Plotly.newPlot failed:', e);
+                    showStatus('error', `Chart render failed: ${e.message} (usando gráfico de respaldo)`);
+                }
+            } else {
+                console.error('Plotly.js did not load');
+                showStatus('error', 'Plotly.js no se cargó (CDN/local) - usando gráfico de respaldo');
+            }
+            try {
+                fallbackChart(parsed);
+            } catch (e) {
+                console.error('fallbackChart failed:', e);
+                showStatus('error', `Chart error: ${e.message}`);
+            }
+        }
+
+        // Minimal canvas candlestick fallback (no dependencies)
+        function fallbackChart(parsed) {
+            const container = document.getElementById('chart');
+            const trace = (parsed.data || []).find(t => t.type === 'candlestick' && t.close && t.close.length);
+            if (!trace) {
+                container.innerHTML = '<p style="color:#718096;padding:20px;">No chart data</p>';
+                return;
+            }
+            container.innerHTML = '';
+            const canvas = document.createElement('canvas');
+            container.appendChild(canvas);
+            const width = container.clientWidth || 800;
+            const height = 600;
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            canvas.style.width = '100%';
+            canvas.style.height = height + 'px';
+            const ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, width, height);
+
+            const n = trace.close.length;
+            let hi = -Infinity, lo = Infinity;
+            for (let i = 0; i < n; i++) {
+                hi = Math.max(hi, trace.high[i]);
+                lo = Math.min(lo, trace.low[i]);
+            }
+            const pad = 50;
+            const plotW = width - 2 * pad;
+            const plotH = height - 2 * pad;
+            const X = i => pad + (n <= 1 ? plotW / 2 : plotW * i / (n - 1));
+            const Y = v => pad + plotH * (1 - (v - lo) / ((hi - lo) || 1));
+
+            ctx.strokeStyle = '#667eea';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            for (let i = 0; i < n; i++) {
+                const x = X(i), y = Y(trace.close[i]);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            const cw = Math.max(2, Math.min(8, plotW / n * 0.6));
+            for (let i = 0; i < n; i++) {
+                const up = trace.close[i] >= trace.open[i];
+                const color = up ? '#26A69A' : '#EF5350';
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(X(i), Y(trace.high[i]));
+                ctx.lineTo(X(i), Y(trace.low[i]));
+                ctx.stroke();
+                const yTop = Y(Math.max(trace.open[i], trace.close[i]));
+                const yBot = Y(Math.min(trace.open[i], trace.close[i]));
+                ctx.fillStyle = color;
+                ctx.fillRect(X(i) - cw / 2, yTop, cw, Math.max(1, yBot - yTop));
+            }
+
+            ctx.fillStyle = '#2d3748';
+            ctx.font = '14px sans-serif';
+            ctx.fillText((parsed.layout && parsed.layout.title && parsed.layout.title.text) || 'Chart (fallback)', pad, 24);
+            ctx.font = '12px sans-serif';
+            ctx.fillStyle = '#718096';
+            ctx.fillText(lo.toFixed(2), 4, height - pad + 12);
+            ctx.fillText(hi.toFixed(2), 4, pad - 6);
+        }
+
         // Initialize after page loads
         document.addEventListener('DOMContentLoaded', function() {
             initializeApp();
@@ -648,6 +833,10 @@
         // Initialize application
         async function initializeApp() {
             console.log('🚀 Initializing Kronos Web UI...');
+
+            if (typeof Plotly === 'undefined') {
+                showStatus('error', 'Plotly.js no se cargó - el gráfico usará el modo de respaldo (canvas)');
+            }
             
             // Load available models
             await loadAvailableModels();
@@ -795,7 +984,15 @@
                     currentDataInfo = response.data.data_info;
                     showDataInfo(response.data.data_info);
                     showStatus('success', response.data.message);
-                    
+
+                    // Render loaded data preview chart
+                    if (response.data.chart) {
+                        const preview = JSON.parse(response.data.chart);
+                        renderChart(preview);
+                        document.getElementById('comparison-section').style.display = 'none';
+                        document.getElementById('prediction-summary').style.display = 'none';
+                    }
+
                     // Update prediction button status
                     if (modelLoaded) {
                         document.getElementById('predict-btn').disabled = false;
@@ -811,6 +1008,80 @@
             } finally {
                 showLoading(false);
                 document.getElementById('load-data-btn').disabled = false;
+            }
+        }
+
+        // Download / update fresh market data
+        async function fetchData() {
+            const source = document.getElementById('fetch-source').value;
+            const symbol = document.getElementById('fetch-symbol').value.trim();
+            const interval = document.getElementById('fetch-interval').value;
+            const preset = document.getElementById('fetch-sector').value;
+
+            if (source === 'us' && preset) {
+                try {
+                    showLoading(true);
+                    document.getElementById('fetch-data-btn').disabled = true;
+                    showStatus('info', `Downloading sector '${preset}' ... this may take a while`);
+
+                    const response = await axios.post('/api/fetch-data', {
+                        source: source,
+                        preset: preset,
+                        interval: interval
+                    });
+
+                    if (response.data.success) {
+                        showStatus('success', response.data.message);
+                        await loadDataFiles();
+                    } else {
+                        showStatus('error', response.data.error);
+                    }
+                } catch (error) {
+                    console.error('❌ Sector download failed:', error);
+                    showStatus('error', `Download failed: ${error.response?.data?.error || error.message}`);
+                } finally {
+                    showLoading(false);
+                    document.getElementById('fetch-data-btn').disabled = false;
+                }
+                return;
+            }
+
+            if (!symbol) {
+                showStatus('error', 'Please enter a symbol (or select a sector preset)');
+                return;
+            }
+
+            try {
+                showLoading(true);
+                document.getElementById('fetch-data-btn').disabled = true;
+                showStatus('info', `Downloading ${symbol.toUpperCase()} data...`);
+
+                const response = await axios.post('/api/fetch-data', {
+                    source: source,
+                    symbol: symbol,
+                    interval: interval
+                });
+
+                if (response.data.success) {
+                    showStatus('success', response.data.message);
+                    await loadDataFiles();
+
+                    const select = document.getElementById('data-file-select');
+                    for (const option of select.options) {
+                        if (option.textContent.startsWith(response.data.file_name)) {
+                            select.value = option.value;
+                            break;
+                        }
+                    }
+                } else {
+                    showStatus('error', response.data.error);
+                }
+            } catch (error) {
+                console.error('❌ Data download failed:', error);
+                showStatus('error', `Download failed: ${error.response?.data?.error || error.message}`);
+            } finally {
+                showLoading(false);
+                document.getElementById('fetch-data-btn').disabled = false;
             }
         }
 
@@ -1100,7 +1371,10 @@
         function displayPredictionResult(result) {
             // Display chart
             const chartData = JSON.parse(result.chart);
-            Plotly.newPlot('chart', chartData.data, chartData.layout);
+            renderChart(chartData);
+            
+            // Display plain-language summary (direction: up / down / sideways)
+            renderPredictionSummary(result.summary);
             
             // Display comparison analysis (if actual data exists)
             if (result.has_comparison) {
@@ -1108,6 +1382,70 @@
             } else {
                 document.getElementById('comparison-section').style.display = 'none';
             }
+        }
+
+        // Render the easy-to-read prediction summary below the chart
+        function renderPredictionSummary(summary) {
+            const panel = document.getElementById('prediction-summary');
+            if (!summary || !summary.pred_closes || !summary.pred_closes.length) {
+                panel.style.display = 'none';
+                return;
+            }
+            panel.style.display = 'block';
+
+            const sign = summary.change_pct > 0 ? '+' : '';
+            const dirEl = document.getElementById('summary-direction');
+            dirEl.className = `summary-direction ${summary.direction}`;
+            dirEl.textContent = `${summary.direction_label} ${sign}${summary.change_pct.toFixed(2)}%`;
+
+            document.getElementById('summary-explanation').textContent = summary.explanation;
+            document.getElementById('summary-details').textContent = summary.details;
+
+            const compEl = document.getElementById('summary-comparison');
+            if (summary.comparison && summary.comparison.text) {
+                compEl.style.display = 'block';
+                compEl.textContent = summary.comparison.text;
+            } else {
+                compEl.style.display = 'none';
+            }
+
+            renderPredictionLineChart(summary);
+        }
+
+        // Small dedicated line chart showing only the predicted price path
+        function renderPredictionLineChart(summary) {
+            const container = document.getElementById('prediction-line-chart');
+            container.innerHTML = '';
+            if (typeof Plotly === 'undefined') return;
+
+            const color = summary.direction === 'up' ? '#16a34a' : summary.direction === 'down' ? '#dc2626' : '#64748b';
+            const points = summary.pred_closes.map((c, i) => ({
+                x: summary.pred_times[i],
+                y: c
+            }));
+            points.unshift({ x: summary.pred_times[0], y: summary.from_price });
+
+            const trace = {
+                x: points.map(p => p.x),
+                y: points.map(p => p.y),
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'Precio previsto',
+                line: { color: color, width: 3 },
+                marker: { size: 6 },
+                hovertemplate: 'Precio previsto: %{y:,.2f}<extra></extra>'
+            };
+
+            const layout = {
+                title: { text: `Predicción: precio esperado en las próximas ${summary.pred_len} velas`, font: { size: 14 } },
+                height: 240,
+                margin: { t: 40, b: 40, l: 70, r: 20 },
+                template: 'plotly_white',
+                xaxis: { showgrid: true, title: 'Tiempo' },
+                yaxis: { showgrid: true, title: 'Precio' }
+            };
+
+            Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
         }
 
         // Display comparison analysis
@@ -1193,6 +1531,28 @@
             
             // Load data button
             document.getElementById('load-data-btn').addEventListener('click', loadData);
+            
+            // Download data button
+            document.getElementById('fetch-data-btn').addEventListener('click', fetchData);
+            
+            // Swap default symbol when source changes
+            document.getElementById('fetch-source').addEventListener('change', function() {
+                const symbolInput = document.getElementById('fetch-symbol');
+                const current = symbolInput.value.trim().toUpperCase();
+                const sectorGroup = document.getElementById('fetch-sector-group');
+                if (this.value === 'us') {
+                    sectorGroup.style.display = 'block';
+                    if (current === '' || current.endsWith('USDT')) {
+                        symbolInput.value = 'AAPL';
+                    }
+                } else {
+                    sectorGroup.style.display = 'none';
+                    document.getElementById('fetch-sector').value = '';
+                    if (current && !current.endsWith('USDT')) {
+                        symbolInput.value = 'BTCUSDT';
+                    }
+                }
+            });
             
             // Prediction button
             document.getElementById('predict-btn').addEventListener('click', startPrediction);
