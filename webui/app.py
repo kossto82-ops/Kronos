@@ -820,6 +820,25 @@ def _direction(pct):
     return 0
 
 
+def _slope_direction(vals):
+    if len(vals) < 10:
+        return 0
+    x = np.arange(len(vals), dtype=float)
+    y = np.asarray(vals, dtype=float)
+    slope = float(np.polyfit(x, y, 1)[0])
+    pct = slope * len(vals) / y[-1] * 100.0 if y[-1] else 0.0
+    return _direction(pct)
+
+
+def _trend_signals(closes):
+    mom60 = ols60 = 0
+    if len(closes) >= 61 and closes[-61]:
+        mom60 = _direction((closes[-1] - closes[-61]) / closes[-61] * 100.0)
+    if len(closes) >= 60:
+        ols60 = _slope_direction(closes[-60:])
+    return mom60, ols60
+
+
 def _verdict_and_text(hit_rate, mape_mean, naive_mape_mean):
     if hit_rate >= 2 / 3 and mape_mean <= naive_mape_mean:
         return 'good', ('Buena: en este fichero acierta la dirección la mayoría de veces y su error '
@@ -860,10 +879,12 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
             p = out['close'].values.astype(float)
             a = df['close'].iloc[end_idx:end_idx + pred_len].values.astype(float)
             base = float(df['close'].iloc[end_idx - 1])
+            closes = df['close'].iloc[end_idx - lookback:end_idx].values.astype(float)
             pred_chg = (float(p[-1]) - base) / base * 100.0
             act_chg = (float(a[-1]) - base) / base * 100.0
             pred_dir = _direction(pred_chg)
             act_dir = _direction(act_chg)
+            mom60_dir, ols60_dir = _trend_signals(closes)
             mape_end = abs(float(p[-1]) - float(a[-1])) / abs(float(a[-1])) * 100.0
             naive_mape_end = abs(base - float(a[-1])) / abs(float(a[-1])) * 100.0
             windows.append({
@@ -872,6 +893,9 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
                 'pred_chg_pct': round(pred_chg, 2),
                 'actual_chg_pct': round(act_chg, 2),
                 'hit': int(pred_dir == act_dir),
+                'mom60_hit': int(mom60_dir == act_dir),
+                'ols60_hit': int(ols60_dir == act_dir),
+                'inv_hit': int(-pred_dir == act_dir) if pred_dir else 0,
                 'mape_end': round(mape_end, 2),
                 'naive_mape_end': round(naive_mape_end, 2),
             })
@@ -879,6 +903,12 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
 
         hits = sum(w['hit'] for w in windows)
         hit_rate = hits / n
+        signals = {}
+        for sig_key, hit_key in (('model', 'hit'), ('mom60', 'mom60_hit'),
+                                 ('ols60', 'ols60_hit'), ('model_inv', 'inv_hit')):
+            sig_hits = sum(w[hit_key] for w in windows)
+            signals[sig_key] = {'hits': sig_hits, 'rate': round(sig_hits / n, 3)}
+        best_signal = max(signals, key=lambda k: signals[k]['rate'])
         mape_mean = float(np.mean([w['mape_end'] for w in windows]))
         naive_mean = float(np.mean([w['naive_mape_end'] for w in windows]))
         verdict, verdict_text = _verdict_and_text(hit_rate, mape_mean, naive_mean)
@@ -891,6 +921,9 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
             'windows': windows,
             'hits': hits,
             'hit_rate': round(hit_rate, 3),
+            'signals': signals,
+            'best_signal': best_signal,
+            'best_signal_rate': signals[best_signal]['rate'],
             'mape_mean': round(mape_mean, 2),
             'naive_mape_mean': round(naive_mean, 2),
             'mape_better_than_naive': mape_mean <= naive_mean,
@@ -925,7 +958,7 @@ def evaluate():
             return jsonify({'error': 'File path cannot be empty'}), 400
         if not MODEL_AVAILABLE or predictor is None:
             return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
-        if not (0 < lookback <= 4096) or not (0 < pred_len <= 1024) or not (1 <= n_windows <= 8):
+        if not (0 < lookback <= 4096) or not (0 < pred_len <= 1024) or not (1 <= n_windows <= 12):
             return jsonify({'error': 'Invalid evaluation parameters'}), 400
         if EVAL_STATE.get('status') == 'running':
             return jsonify({'error': 'An evaluation is already running'}), 409
@@ -1188,6 +1221,25 @@ def predict():
                 'amount': float(row['amount']) if 'amount' in row else 0
             })
         
+        signal = None
+        try:
+            closes = x_df['close'].values.astype(float)
+            base_px = float(closes[-1])
+            end_px = float(prediction_results[-1]['close'])
+            if base_px:
+                model_pct = (end_px - base_px) / base_px * 100.0
+                model_dir = _direction(model_pct)
+                mom60_dir, ols60_dir = _trend_signals(closes)
+                signal = {
+                    'model_dir': model_dir,
+                    'model_chg_pct': round(model_pct, 2),
+                    'mom60_dir': mom60_dir,
+                    'ols60_dir': ols60_dir,
+                    'agree_trend': bool(model_dir and mom60_dir and model_dir == mom60_dir),
+                }
+        except Exception:
+            signal = None
+
         # Save prediction results to file
         try:
             save_prediction_results(
@@ -1222,6 +1274,7 @@ def predict():
                 'mode': mode
             },
             'confidence': load_eval_cache(file_path, lookback, pred_len),
+            'signal': signal,
             'has_comparison': len(actual_data) > 0,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })

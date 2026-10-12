@@ -390,6 +390,40 @@
             font-size: 13px;
         }
 
+        .confidence-signals {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #4a5568;
+            line-height: 1.6;
+        }
+
+        .confidence-signals .best {
+            color: #2f855a;
+            font-weight: 600;
+        }
+
+        .summary-signal {
+            margin: 8px 0;
+            padding: 8px 12px;
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #2d3748;
+        }
+
+        .summary-signal.agree {
+            background: #f0fff4;
+            border-color: #c6f6d5;
+            color: #22543d;
+        }
+
+        .summary-signal.disagree {
+            background: #fffaf0;
+            border-color: #feebc8;
+            color: #7b341e;
+        }
+
         #evaluate-btn[disabled] {
             opacity: 0.55;
             cursor: not-allowed;
@@ -710,6 +744,7 @@
                     <label>Confianza del modelo en este fichero:</label>
                     <div id="confidence-result" class="confidence-result neutral">Sin evaluar</div>
                     <div id="confidence-detail" class="confidence-detail"></div>
+                <div id="confidence-signals" class="confidence-signals"></div>
                     <button type="button" id="evaluate-btn" class="btn btn-secondary" disabled>📊 Evaluar confianza (~3 min)</button>
                     <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara el acierto de dirección y el error final con "no hacer nada". El resultado se guarda por fichero.</small>
                 </div>
@@ -746,7 +781,8 @@
 <div id="prediction-summary" class="prediction-summary" style="display: none;">
 <div id="summary-mode" class="summary-mode">-</div>
 <div id="summary-direction" class="summary-direction">-</div>
-<p id="summary-explanation" class="summary-explanation"></p>
+                <p id="summary-explanation" class="summary-explanation"></p>
+                <div id="summary-signal" class="summary-signal" style="display:none;"></div>
 <div id="confidence-warning" class="confidence-warning" style="display:none;"></div>
 <p id="summary-details" class="summary-details"></p>
 <div id="prediction-line-chart"></div>
@@ -1491,13 +1527,49 @@
             if (cw) {
                 if (conf && conf.verdict && conf.verdict !== 'good') {
                     cw.style.display = 'block';
-                    cw.textContent = `⚠ ${conf.verdict_text} ` +
+                    let warn = `⚠ ${conf.verdict_text} ` +
                         `(acertó ${conf.hits}/${conf.n_windows} ventanas; error final ${conf.mape_mean}% ` +
                         `vs ${conf.naive_mape_mean}% de no hacer nada).`;
+                    if (conf.signals && conf.best_signal && conf.best_signal !== 'model') {
+                        const names = { model: 'modelo', mom60: 'tendencia 60d', ols60: 'recta 60d', model_inv: 'modelo invertido' };
+                        warn += ` Mejor señal histórica en este fichero: ${names[conf.best_signal] || conf.best_signal} ` +
+                            `(${Math.round(conf.best_signal_rate * 100)}%).`;
+                    }
+                    cw.textContent = warn;
                 } else {
                     cw.style.display = 'none';
                 }
             }
+
+            renderPredictionSignal(result.signal);
+        }
+
+        // Render the live confluence signal (model vs 60-day trend) in the summary
+        function renderPredictionSignal(signal) {
+            const el = document.getElementById('summary-signal');
+            if (!el) return;
+            if (!signal || typeof signal.model_dir !== 'number') {
+                el.style.display = 'none';
+                return;
+            }
+            const dirTxt = d => (d > 0 ? 'SUBIR' : (d < 0 ? 'BAJAR' : 'PLANO'));
+            const chg = signal.model_chg_pct;
+            const modelTxt = `${dirTxt(signal.model_dir)} ${chg > 0 ? '+' : ''}${chg.toFixed(2)}%`;
+            let cls = 'summary-signal';
+            let verdict;
+            if (signal.agree_trend) {
+                cls += ' agree';
+                verdict = '✓ el modelo coincide con la tendencia de 60 días';
+            } else if (signal.model_dir && signal.mom60_dir) {
+                cls += ' disagree';
+                verdict = '⚠ el modelo contradice la tendencia de 60 días';
+            } else {
+                verdict = 'señal mixta (alguna dirección plana)';
+            }
+            el.className = cls;
+            el.style.display = 'block';
+            el.textContent = `Señal confluente: modelo ${modelTxt} · tendencia 60d ${dirTxt(signal.mom60_dir)} · ` +
+                `recta 60d ${dirTxt(signal.ols60_dir)} → ${verdict}`;
         }
 
         // Render the easy-to-read prediction summary below the chart
@@ -1574,12 +1646,14 @@
         function renderConfidence(result) {
             const el = document.getElementById('confidence-result');
             const det = document.getElementById('confidence-detail');
+            const sigEl = document.getElementById('confidence-signals');
             if (!el) return;
             if (!result) {
                 currentConfidence = null;
                 el.className = 'confidence-result neutral';
                 el.textContent = 'Sin evaluar';
                 if (det) det.textContent = '';
+                if (sigEl) sigEl.textContent = '';
                 return;
             }
             currentConfidence = result;
@@ -1589,6 +1663,19 @@
                 const when = (result.evaluated_at || '').slice(0, 16).replace('T', ' ');
                 det.textContent = `Error medio al final: ${result.mape_mean}% vs ${result.naive_mape_mean}% de no hacer nada · ` +
                     `${result.n_windows} ventana${result.n_windows > 1 ? 's' : ''} de ${result.pred_len} velas · evaluado ${when}`;
+            }
+            if (sigEl) {
+                if (result.signals && result.n_windows) {
+                    const names = { model: 'modelo', mom60: 'tendencia 60d', ols60: 'recta 60d', model_inv: 'modelo invertido' };
+                    const parts = Object.entries(result.signals).map(([k, v]) => {
+                        const isBest = k === result.best_signal;
+                        const label = `${names[k] || k} ${v.hits}/${result.n_windows} (${Math.round(v.rate * 100)}%)${isBest ? ' ★' : ''}`;
+                        return isBest ? `<span class="best">${label}</span>` : `<span>${label}</span>`;
+                    });
+                    sigEl.innerHTML = 'Acierto por señal (★ = mejor aquí): ' + parts.join(' · ');
+                } else {
+                    sigEl.textContent = '';
+                }
             }
         }
 
@@ -1613,16 +1700,20 @@
             const pl = currentPredLen();
             const nWindows = pl >= 120 ? 4 : (pl >= 60 ? 8 : 10);
             try {
-                const start = await axios.post('/api/evaluate', {
-                    file_path: currentDataFile,
-                    lookback: 400,
-                    pred_len: pl,
-                    n_windows: nWindows,
-                    force: true
-                });
-                if (start.data.cached && start.data.result) {
-                    renderConfidence(start.data.result);
-                    return;
+                try {
+                    const start = await axios.post('/api/evaluate', {
+                        file_path: currentDataFile,
+                        lookback: 400,
+                        pred_len: pl,
+                        n_windows: nWindows,
+                        force: true
+                    });
+                    if (start.data.cached && start.data.result) {
+                        renderConfidence(start.data.result);
+                        return;
+                    }
+                } catch (e) {
+                    if (e.response && e.response.status !== 409) throw e; // other eval running: just poll for it
                 }
                 el.className = 'confidence-result neutral';
                 while (true) {
@@ -1640,6 +1731,8 @@
                         el.className = 'confidence-result bad';
                         el.textContent = 'Error en la evaluación';
                         det.textContent = st.error || 'error desconocido';
+                        break;
+                    } else {
                         break;
                     }
                 }
