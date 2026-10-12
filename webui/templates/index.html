@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <link rel="icon" href="data:,">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kronos Financial Prediction Web UI</title>
@@ -622,7 +623,7 @@
                         <option value="1h">1 hour</option>
                         <option value="5m">5 minutes</option>
                     </select>
-                    <small class="form-text">Daily recommended (needs >= 520 candles for a full window)</small>
+                    <small class="form-text" id="fetch-hint">Daily recommended (needs >= 520 candles for a full window)</small>
                 </div>
 
                 <button id="fetch-data-btn" class="btn btn-warning">
@@ -663,7 +664,7 @@
                         </div>
                     </div>
                     
-                    <small class="form-text">Drag slider to select time window position for 520 data points, green area represents fixed 400+120 data point range</small>
+                    <small class="form-text" id="slider-hint">Drag slider to select time window position for 520 data points, green area represents fixed 400+120 data point range</small>
                 </div>
 
                 <!-- Prediction Parameters -->
@@ -674,9 +675,13 @@
                 </div>
 
                 <div class="form-group">
-                    <label for="pred-len">Prediction Length:</label>
-                    <input type="number" id="pred-len" value="120" readonly>
-                    <small class="form-text">Fixed at 120 data points</small>
+                    <label for="pred-len">Prediction Length (horizonte):</label>
+                    <select id="pred-len">
+                        <option value="30">30 velas (corto plazo)</option>
+                        <option value="60">60 velas (medio plazo)</option>
+                        <option value="120" selected>120 velas (largo plazo)</option>
+                    </select>
+                    <small class="form-text" id="pred-len-hint">Número de velas futuras a predecir. Más corto = más fácil acertar la dirección; más largo = más ambición pero más ruido.</small>
                 </div>
 
                 <!-- Prediction Quality Parameters -->
@@ -706,7 +711,7 @@
                     <div id="confidence-result" class="confidence-result neutral">Sin evaluar</div>
                     <div id="confidence-detail" class="confidence-detail"></div>
                     <button type="button" id="evaluate-btn" class="btn btn-secondary" disabled>📊 Evaluar confianza (~3 min)</button>
-                    <small class="form-text">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara el acierto de dirección y el error final con "no hacer nada". El resultado se guarda por fichero.</small>
+                    <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara el acierto de dirección y el error final con "no hacer nada". El resultado se guarda por fichero.</small>
                 </div>
 
                 <div class="form-group">
@@ -1254,12 +1259,31 @@
         }
 
         // Update start handle position
+        function currentPredLen() {
+            return parseInt(document.getElementById('pred-len').value) || 120;
+        }
+
+        function currentWindowSize() {
+            return 400 + currentPredLen();
+        }
+
+        function updateHorizonHints() {
+            const ws = currentWindowSize();
+            const pl = currentPredLen();
+            const hint = document.getElementById('slider-hint');
+            if (hint) hint.textContent = `Drag slider to select time window position for ${ws} data points, green area represents 400+${pl} data point range`;
+            const fh = document.getElementById('fetch-hint');
+            if (fh) fh.textContent = `Daily recommended (needs >= ${ws} candles for a full window)`;
+            const ch = document.getElementById('confidence-hint');
+            if (ch) ch.textContent = `Auto-evaluación walk-forward: predice las últimas ventanas de ${pl} velas (T=0, determinista) y compara el acierto de dirección y el error final con "no hacer nada". El resultado se guarda por fichero.`;
+            updateModeHint();
+        }
+
         function updateStartHandle(percentage) {
             const startHandle = document.getElementById('start-handle');
             const selection = document.getElementById('slider-selection');
             
-            // Fixed window size of 520 data points
-            const windowSize = 520;
+            const windowSize = currentWindowSize();
             const totalRows = sliderData ? sliderData.totalRows : 1000;
             const windowPercentage = windowSize / totalRows;
             
@@ -1282,8 +1306,7 @@
             const endHandle = document.getElementById('end-handle');
             const selection = document.getElementById('slider-selection');
             
-            // Fixed window size of 520 data points
-            const windowSize = 520;
+            const windowSize = currentWindowSize();
             const totalRows = sliderData ? sliderData.totalRows : 1000;
             const windowPercentage = windowSize / totalRows;
             
@@ -1323,22 +1346,21 @@
             document.getElementById('window-start').textContent = `Start: ${startDate.toLocaleDateString()}`;
             document.getElementById('window-end').textContent = `End: ${endDate.toLocaleDateString()}`;
             
-            // Display fixed window size
-            document.getElementById('window-size').textContent = `Window Size: 400 + 120 = 520 data points (fixed)`;
+            // Display dynamic window size
+            const pl = currentPredLen();
+            document.getElementById('window-size').textContent = `Window Size: 400 + ${pl} = ${400 + pl} data points`;
             
-            // Input field values remain fixed
+            // Keep lookback fixed; pred-len is controlled by its select
             document.getElementById('lookback').value = 400;
-            document.getElementById('pred-len').value = 120;
         }
 
         // Update slider based on input fields
         function updateSliderFromInputs() {
             if (!sliderData) return;
             
-            // Fixed window size: 400 + 120 = 520 data points
             const lookback = 400;
-            const predLen = 120;
-            const windowSize = lookback + predLen; // Fixed at 520
+            const predLen = currentPredLen();
+            const windowSize = lookback + predLen;
             
             // Calculate slider position
             const totalRows = sliderData.totalRows;
@@ -1529,7 +1551,7 @@
             if (!hint) return;
             const mode = document.querySelector('input[name="prediction-mode"]:checked').value;
             if (mode === 'future') {
-                hint.textContent = 'Usa las últimas 400 velas reales y genera 120 velas NUEVAS a partir del último dato real (hoy).';
+                hint.textContent = `Usa las últimas 400 velas reales y genera ${currentPredLen()} velas NUEVAS a partir del último dato real (hoy).`;
             } else {
                 hint.textContent = 'Coge un tramo PASADO del fichero, lo "predice" y lo compara con lo real (para medir el acierto del modelo).';
             }
@@ -1573,7 +1595,9 @@
         async function refreshConfidence(filePath) {
             if (!filePath) return;
             try {
-                const r = await axios.get('/api/evaluate-cache', { params: { file_path: filePath } });
+                const r = await axios.get('/api/evaluate-cache', {
+                    params: { file_path: filePath, lookback: 400, pred_len: currentPredLen() }
+                });
                 renderConfidence(r.data.cached ? r.data.result : null);
             } catch (e) {
                 console.error('Failed to load confidence cache:', e);
@@ -1586,12 +1610,14 @@
             updateEvaluateBtn();
             const el = document.getElementById('confidence-result');
             const det = document.getElementById('confidence-detail');
+            const pl = currentPredLen();
+            const nWindows = pl >= 120 ? 4 : (pl >= 60 ? 8 : 10);
             try {
                 const start = await axios.post('/api/evaluate', {
                     file_path: currentDataFile,
                     lookback: 400,
-                    pred_len: 120,
-                    n_windows: 4,
+                    pred_len: pl,
+                    n_windows: nWindows,
                     force: true
                 });
                 if (start.data.cached && start.data.result) {
@@ -1786,8 +1812,16 @@
             });
             
             // Update slider when lookback window size changes
-            document.getElementById('lookback').addEventListener('input', updateSliderFromInputs);
-            document.getElementById('pred-len').addEventListener('input', updateSliderFromInputs);
+        document.getElementById('lookback').addEventListener('input', updateSliderFromInputs);
+        document.getElementById('pred-len').addEventListener('change', function () {
+            const handle = document.getElementById('start-handle');
+            let pct = handle && handle.style.left ? parseFloat(handle.style.left) / 100 : 0.1;
+            if (isNaN(pct)) pct = 0.1;
+            updateStartHandle(pct);
+            updateSliderFromHandles();
+            updateHorizonHints();
+            if (currentDataFile) refreshConfidence(currentDataFile);
+        });
         }
 
         // Display status information

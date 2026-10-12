@@ -786,25 +786,26 @@ EVAL_STATE = {'status': 'idle', 'progress': 0, 'total': 0, 'file_path': None, 'r
 EVAL_CACHE = {}
 
 
-def _eval_cache_path(file_path):
+def _eval_cache_path(file_path, lookback, pred_len):
     try:
         st = os.stat(file_path)
-        key = f"{os.path.abspath(file_path)}|{st.st_size}|{int(st.st_mtime)}"
+        key = f"{os.path.abspath(file_path)}|{st.st_size}|{int(st.st_mtime)}|{lookback}|{pred_len}"
     except OSError:
-        key = os.path.abspath(file_path)
+        key = f"{os.path.abspath(file_path)}|{lookback}|{pred_len}"
     name = hashlib.md5(key.encode('utf-8')).hexdigest()
     return os.path.join(EVAL_DIR, name + '.json')
 
 
-def load_eval_cache(file_path):
-    if file_path in EVAL_CACHE:
-        return EVAL_CACHE[file_path]
-    path = _eval_cache_path(file_path)
+def load_eval_cache(file_path, lookback=400, pred_len=120):
+    cache_key = (file_path, lookback, pred_len)
+    if cache_key in EVAL_CACHE:
+        return EVAL_CACHE[cache_key]
+    path = _eval_cache_path(file_path, lookback, pred_len)
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 result = json.load(f)
-            EVAL_CACHE[file_path] = result
+            EVAL_CACHE[cache_key] = result
             return result
         except Exception:
             return None
@@ -899,11 +900,11 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
         }
         try:
             os.makedirs(EVAL_DIR, exist_ok=True)
-            with open(_eval_cache_path(file_path), 'w', encoding='utf-8') as f:
+            with open(_eval_cache_path(file_path, lookback, pred_len), 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        EVAL_CACHE[file_path] = result
+        EVAL_CACHE[(file_path, lookback, pred_len)] = result
         EVAL_STATE.update(status='done', result=result, error=None)
     except Exception as e:
         EVAL_STATE.update(status='error', error=str(e))
@@ -929,7 +930,7 @@ def evaluate():
         if EVAL_STATE.get('status') == 'running':
             return jsonify({'error': 'An evaluation is already running'}), 409
 
-        cached = load_eval_cache(file_path)
+        cached = load_eval_cache(file_path, lookback, pred_len)
         if cached and not force:
             return jsonify({'started': False, 'cached': True, 'result': cached})
 
@@ -951,7 +952,12 @@ def evaluate_cache():
     file_path = request.args.get('file_path')
     if not file_path:
         return jsonify({'error': 'file_path is required'}), 400
-    result = load_eval_cache(file_path)
+    try:
+        lookback = int(request.args.get('lookback', 400))
+        pred_len = int(request.args.get('pred_len', 120))
+    except ValueError:
+        return jsonify({'error': 'Invalid lookback/pred_len'}), 400
+    result = load_eval_cache(file_path, lookback, pred_len)
     return jsonify({'cached': result is not None, 'result': result})
 
 
@@ -1215,7 +1221,7 @@ def predict():
                 'sample_count': sample_count,
                 'mode': mode
             },
-            'confidence': load_eval_cache(file_path),
+            'confidence': load_eval_cache(file_path, lookback, pred_len),
             'has_comparison': len(actual_data) > 0,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
