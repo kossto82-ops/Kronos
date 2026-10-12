@@ -371,6 +371,10 @@ def top_k_top_p_filtering(
 
 
 def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_logits=True):
+    if temperature is None or temperature <= 0:
+        # Greedy decoding: fully deterministic and avoids division by zero
+        _, x = torch.topk(logits, k=1, dim=-1)
+        return x
     logits = logits / temperature
     if top_k is not None or top_p is not None:
         if top_k > 0 or top_p < 1.0:
@@ -504,6 +508,8 @@ class KronosPredictor:
 
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
+        self.model.eval()
+        self.tokenizer.eval()
 
     def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
 

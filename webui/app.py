@@ -10,6 +10,8 @@ import sys
 import warnings
 import datetime
 import requests
+import threading
+import hashlib
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
@@ -95,38 +97,51 @@ def load_data_file(file_path):
         else:
             return None, "Unsupported file format"
         
+        # Normalize column names to lowercase (CSVs often use Date/Open/...)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated()]
+        
         # Check required columns
         required_cols = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required_cols):
-            return None, f"Missing required columns: {required_cols}"
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            return None, f"Missing required columns: {missing} (found: {list(df.columns)})"
         
         # Process timestamp column
-        if 'timestamps' in df.columns:
-            df['timestamps'] = pd.to_datetime(df['timestamps'])
-        elif 'timestamp' in df.columns:
-            df['timestamps'] = pd.to_datetime(df['timestamp'])
-        elif 'date' in df.columns:
-            # If column name is 'date', rename it to 'timestamps'
-            df['timestamps'] = pd.to_datetime(df['date'])
+        ts_col = next((c for c in ['timestamps', 'timestamp', 'date', 'datetime', 'time'] if c in df.columns), None)
+        if ts_col is not None:
+            df['timestamps'] = pd.to_datetime(df[ts_col], errors='coerce')
+            if df['timestamps'].isna().any():
+                df = df.dropna(subset=['timestamps'])
         else:
-            # If no timestamp column exists, create one
-            df['timestamps'] = pd.date_range(start='2024-01-01', periods=len(df), freq='1H')
+            # No date column: generate synthetic hourly timestamps (flagged for the UI)
+            df['timestamps'] = pd.date_range(start='2024-01-01', periods=len(df), freq='1h')
+            df.attrs['synthetic_timestamps'] = True
         
         # Ensure numeric columns are numeric type
-        for col in ['open', 'high', 'low', 'close']:
+        for col in required_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Process volume column (optional)
-        if 'volume' in df.columns:
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        # Process volume/amount columns (optional)
+        for col in ['volume', 'amount']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Process amount column (optional, but not used for prediction)
-        if 'amount' in df.columns:
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+        # Sort by time (stable) and keep only the last value per timestamp
+        df = df.sort_values('timestamps', kind='stable')
+        df = df.drop_duplicates(subset=['timestamps'], keep='last')
         
-        # Remove rows containing NaN values
-        df = df.dropna()
+        # Remove rows with invalid values only in the columns used for prediction
+        subset = required_cols + (['volume'] if 'volume' in df.columns else [])
+        before = len(df)
+        df = df.dropna(subset=subset)
+        if before != len(df):
+            df.attrs['dropped_rows'] = before - len(df)
         
+        if len(df) == 0:
+            return None, "File contains no valid rows after cleaning"
+        
+        df = df.reset_index(drop=True)
         return df, None
         
     except Exception as e:
@@ -380,39 +395,37 @@ def save_prediction_results(file_path, prediction_type, prediction_results, actu
             'analysis': {}
         }
         
-        # If actual data exists, perform comparison analysis
-        if actual_data and len(actual_data) > 0:
-            # Calculate continuity analysis
-            if len(prediction_results) > 0 and len(actual_data) > 0:
-                last_pred = prediction_results[0]  # First prediction point
+        # Continuity analysis only makes sense with both prediction and actual data
+        if prediction_results and actual_data:
+            last_pred = prediction_results[0]  # First prediction point
             first_actual = actual_data[0]      # First actual point
-                
+
             save_data['analysis']['continuity'] = {
-                    'last_prediction': {
-                        'open': last_pred['open'],
-                        'high': last_pred['high'],
-                        'low': last_pred['low'],
-                        'close': last_pred['close']
-                    },
-                    'first_actual': {
-                        'open': first_actual['open'],
-                        'high': first_actual['high'],
-                        'low': first_actual['low'],
-                        'close': first_actual['close']
-                    },
-                    'gaps': {
-                        'open_gap': abs(last_pred['open'] - first_actual['open']),
-                        'high_gap': abs(last_pred['high'] - first_actual['high']),
-                        'low_gap': abs(last_pred['low'] - first_actual['low']),
-                        'close_gap': abs(last_pred['close'] - first_actual['close'])
-                    },
-                    'gap_percentages': {
-                        'open_gap_pct': (abs(last_pred['open'] - first_actual['open']) / first_actual['open']) * 100,
-                        'high_gap_pct': (abs(last_pred['high'] - first_actual['high']) / first_actual['high']) * 100,
-                        'low_gap_pct': (abs(last_pred['low'] - first_actual['low']) / first_actual['low']) * 100,
-                        'close_gap_pct': (abs(last_pred['close'] - first_actual['close']) / first_actual['close']) * 100
-                    }
+                'last_prediction': {
+                    'open': last_pred['open'],
+                    'high': last_pred['high'],
+                    'low': last_pred['low'],
+                    'close': last_pred['close']
+                },
+                'first_actual': {
+                    'open': first_actual['open'],
+                    'high': first_actual['high'],
+                    'low': first_actual['low'],
+                    'close': first_actual['close']
+                },
+                'gaps': {
+                    'open_gap': abs(last_pred['open'] - first_actual['open']),
+                    'high_gap': abs(last_pred['high'] - first_actual['high']),
+                    'low_gap': abs(last_pred['low'] - first_actual['low']),
+                    'close_gap': abs(last_pred['close'] - first_actual['close'])
+                },
+                'gap_percentages': {
+                    'open_gap_pct': (abs(last_pred['open'] - first_actual['open']) / first_actual['open']) * 100,
+                    'high_gap_pct': (abs(last_pred['high'] - first_actual['high']) / first_actual['high']) * 100,
+                    'low_gap_pct': (abs(last_pred['low'] - first_actual['low']) / first_actual['low']) * 100,
+                    'close_gap_pct': (abs(last_pred['close'] - first_actual['close']) / first_actual['close']) * 100
                 }
+            }
         
         # Save to file
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -623,6 +636,12 @@ def load_data():
             else:
                 return f"{avg_diff.days} days"
         
+        warnings = []
+        if df.attrs.get('synthetic_timestamps'):
+            warnings.append('The file has no date column: synthetic hourly timestamps were generated, dates shown are NOT real')
+        if df.attrs.get('dropped_rows'):
+            warnings.append(f"Removed {df.attrs['dropped_rows']} rows with invalid values")
+        
         # Return data information
         data_info = {
             'rows': len(df),
@@ -641,14 +660,19 @@ def load_data():
             'success': True,
             'data_info': data_info,
             'chart': create_overview_chart(df),
+            'warnings': warnings,
             'message': f'Successfully loaded data, total {len(df)} rows'
         })
         
     except Exception as e:
         return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
 
-def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=None):
-    """Build a plain-language summary about where the prediction goes (up/down/sideways)."""
+def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=None, is_forward=False):
+    """Build a plain-language summary about where the prediction goes (up/down/sideways).
+
+    is_forward=True means the prediction covers candles BEYOND the last real data point;
+    otherwise it is a backtest over a window that already exists in the file.
+    """
     from_price = float(x_df['close'].iloc[-1]) if x_df is not None and len(x_df) > 0 else 0.0
     pred_closes = [float(r['close']) for r in prediction_results]
     pred_times = [r['timestamp'] for r in prediction_results]
@@ -684,11 +708,22 @@ def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=Non
     daily_vol = float(np.mean([abs(p) for p in pct_series])) if pct_series else 0.0
 
     fmt = lambda v: f"{v:,.2f}"
-    explanation = (
-        f"Según la predicción, el precio podría {direction_label.lower()} "
-        f"un {abs(change_pct):.2f}% en las próximas {pred_len} velas: "
-        f"de {fmt(from_price)} a {fmt(end_price)} aprox."
-    )
+    start_date = str(pred_times[0])[:10]
+    end_date = str(pred_times[-1])[:10]
+
+    if is_forward:
+        explanation = (
+            f"Previsión hacia el futuro, del {start_date} al {end_date}: se espera que el precio "
+            f"pueda {direction_label.lower()} alrededor de un {abs(change_pct):.2f}% respecto al "
+            f"último dato real ({fmt(from_price)}) hasta {fmt(end_price)}."
+        )
+    else:
+        explanation = (
+            f"Esto es un backtest (prueba) del {start_date} al {end_date}: esas {pred_len} velas ya "
+            f"ocurrieron en el fichero de datos. La predicción indicaba {direction_label.lower()} "
+            f"un {abs(change_pct):.2f}% (de {fmt(from_price)} a {fmt(end_price)}), y abajo se "
+            f"compara con lo que realmente pasó."
+        )
     details = (
         f"El rango previsto va de {fmt(lo)} a {fmt(hi)} (±{range_pct:.2f}% del precio de partida), "
         f"con una variación típica de ±{daily_vol:.2f}% por vela."
@@ -732,10 +767,192 @@ def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=Non
         'pred_len': pred_len,
         'pred_closes': pred_closes,
         'pred_times': pred_times,
+        'is_forward': is_forward,
+        'start_date': start_date,
+        'end_date': end_date,
         'explanation': explanation,
         'details': details,
         'comparison': comparison,
     }
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward self-evaluation: does the model actually work on THIS file?
+# Predicts the last N non-overlapping windows (T=0, deterministic) and
+# compares direction hit-rate and end error against "do nothing" (last price).
+
+EVAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'evaluation_results')
+EVAL_STATE = {'status': 'idle', 'progress': 0, 'total': 0, 'file_path': None, 'result': None, 'error': None}
+EVAL_CACHE = {}
+
+
+def _eval_cache_path(file_path):
+    try:
+        st = os.stat(file_path)
+        key = f"{os.path.abspath(file_path)}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        key = os.path.abspath(file_path)
+    name = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(EVAL_DIR, name + '.json')
+
+
+def load_eval_cache(file_path):
+    if file_path in EVAL_CACHE:
+        return EVAL_CACHE[file_path]
+    path = _eval_cache_path(file_path)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+            EVAL_CACHE[file_path] = result
+            return result
+        except Exception:
+            return None
+    return None
+
+
+def _direction(pct):
+    if pct > 0.15:
+        return 1
+    if pct < -0.15:
+        return -1
+    return 0
+
+
+def _verdict_and_text(hit_rate, mape_mean, naive_mape_mean):
+    if hit_rate >= 2 / 3 and mape_mean <= naive_mape_mean:
+        return 'good', ('Buena: en este fichero acierta la dirección la mayoría de veces y su error '
+                        'final es mejor que quedarse quieto (no hacer nada).')
+    if hit_rate >= 0.5:
+        return 'medium', ('Media: resultados mixtos; usa la predicción solo como señal secundaria, '
+                          'nunca como única razón para operar.')
+    return 'bad', ('Baja: históricamente peor que no hacer nada en este fichero; '
+                   'no conviene fiarse de sus predicciones aquí.')
+
+
+def _run_evaluation(file_path, lookback, pred_len, n_windows):
+    try:
+        df, error = load_data_file(file_path)
+        if error:
+            EVAL_STATE.update(status='error', error=error)
+            return
+        if 'timestamps' not in df.columns:
+            EVAL_STATE.update(status='error', error='The file has no valid timestamps, cannot evaluate')
+            return
+        n_max = (len(df) - lookback) // pred_len
+        if n_max < 1:
+            EVAL_STATE.update(status='error', error=(
+                f'Insufficient data: need at least {lookback + pred_len} rows to evaluate, file has {len(df)}'))
+            return
+        n = max(1, min(n_windows, n_max))
+        EVAL_STATE['total'] = n
+        pred = predictor
+        cols = ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else [])
+        windows = []
+        for i in range(n):
+            end_idx = len(df) - (i + 1) * pred_len
+            x_df = df.iloc[end_idx - lookback:end_idx][cols].copy()
+            x_ts = df['timestamps'].iloc[end_idx - lookback:end_idx].reset_index(drop=True)
+            y_ts = df['timestamps'].iloc[end_idx:end_idx + pred_len].reset_index(drop=True)
+            out = pred.predict(df=x_df, x_timestamp=x_ts, y_timestamp=y_ts,
+                               pred_len=pred_len, T=0.0, top_p=0.9, sample_count=1, verbose=False)
+            p = out['close'].values.astype(float)
+            a = df['close'].iloc[end_idx:end_idx + pred_len].values.astype(float)
+            base = float(df['close'].iloc[end_idx - 1])
+            pred_chg = (float(p[-1]) - base) / base * 100.0
+            act_chg = (float(a[-1]) - base) / base * 100.0
+            pred_dir = _direction(pred_chg)
+            act_dir = _direction(act_chg)
+            mape_end = abs(float(p[-1]) - float(a[-1])) / abs(float(a[-1])) * 100.0
+            naive_mape_end = abs(base - float(a[-1])) / abs(float(a[-1])) * 100.0
+            windows.append({
+                'start_date': str(df['timestamps'].iloc[end_idx])[:10],
+                'end_date': str(df['timestamps'].iloc[end_idx + pred_len - 1])[:10],
+                'pred_chg_pct': round(pred_chg, 2),
+                'actual_chg_pct': round(act_chg, 2),
+                'hit': int(pred_dir == act_dir),
+                'mape_end': round(mape_end, 2),
+                'naive_mape_end': round(naive_mape_end, 2),
+            })
+            EVAL_STATE['progress'] = i + 1
+
+        hits = sum(w['hit'] for w in windows)
+        hit_rate = hits / n
+        mape_mean = float(np.mean([w['mape_end'] for w in windows]))
+        naive_mean = float(np.mean([w['naive_mape_end'] for w in windows]))
+        verdict, verdict_text = _verdict_and_text(hit_rate, mape_mean, naive_mean)
+        result = {
+            'file_path': file_path,
+            'file_rows': len(df),
+            'lookback': lookback,
+            'pred_len': pred_len,
+            'n_windows': n,
+            'windows': windows,
+            'hits': hits,
+            'hit_rate': round(hit_rate, 3),
+            'mape_mean': round(mape_mean, 2),
+            'naive_mape_mean': round(naive_mean, 2),
+            'mape_better_than_naive': mape_mean <= naive_mean,
+            'verdict': verdict,
+            'verdict_text': verdict_text,
+            'evaluated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        }
+        try:
+            os.makedirs(EVAL_DIR, exist_ok=True)
+            with open(_eval_cache_path(file_path), 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        EVAL_CACHE[file_path] = result
+        EVAL_STATE.update(status='done', result=result, error=None)
+    except Exception as e:
+        EVAL_STATE.update(status='error', error=str(e))
+
+
+@app.route('/api/evaluate', methods=['POST'])
+def evaluate():
+    """Start a walk-forward self-evaluation for a data file (runs in background)."""
+    try:
+        data = request.get_json() or {}
+        file_path = data.get('file_path')
+        force = bool(data.get('force', False))
+        lookback = int(data.get('lookback', 400))
+        pred_len = int(data.get('pred_len', 120))
+        n_windows = int(data.get('n_windows', 4))
+
+        if not file_path:
+            return jsonify({'error': 'File path cannot be empty'}), 400
+        if not MODEL_AVAILABLE or predictor is None:
+            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+        if not (0 < lookback <= 4096) or not (0 < pred_len <= 1024) or not (1 <= n_windows <= 8):
+            return jsonify({'error': 'Invalid evaluation parameters'}), 400
+        if EVAL_STATE.get('status') == 'running':
+            return jsonify({'error': 'An evaluation is already running'}), 409
+
+        cached = load_eval_cache(file_path)
+        if cached and not force:
+            return jsonify({'started': False, 'cached': True, 'result': cached})
+
+        EVAL_STATE.update(status='running', progress=0, total=0, file_path=file_path, result=None, error=None)
+        thread = threading.Thread(target=_run_evaluation, args=(file_path, lookback, pred_len, n_windows), daemon=True)
+        thread.start()
+        return jsonify({'started': True, 'file_path': file_path})
+    except Exception as e:
+        return jsonify({'error': f'Evaluation failed: {str(e)}'}), 500
+
+
+@app.route('/api/evaluate-status', methods=['GET'])
+def evaluate_status():
+    return jsonify(EVAL_STATE)
+
+
+@app.route('/api/evaluate-cache', methods=['GET'])
+def evaluate_cache():
+    file_path = request.args.get('file_path')
+    if not file_path:
+        return jsonify({'error': 'file_path is required'}), 400
+    result = load_eval_cache(file_path)
+    return jsonify({'cached': result is not None, 'result': result})
 
 
 @app.route('/api/predict', methods=['POST'])
@@ -751,17 +968,33 @@ def predict():
         temperature = float(data.get('temperature', 1.0))
         top_p = float(data.get('top_p', 0.9))
         sample_count = int(data.get('sample_count', 1))
+        mode = data.get('mode', 'backtest')
+        start_date = data.get('start_date')
         
         if not file_path:
             return jsonify({'error': 'File path cannot be empty'}), 400
+        if mode not in ('backtest', 'future'):
+            return jsonify({'error': f"Invalid mode '{mode}', expected 'backtest' or 'future'"}), 400
+        if not (0 < lookback <= 4096):
+            return jsonify({'error': 'lookback must be between 1 and 4096'}), 400
+        if not (0 < pred_len <= 1024):
+            return jsonify({'error': 'pred_len must be between 1 and 1024'}), 400
+        if temperature < 0 or temperature > 5:
+            return jsonify({'error': 'temperature must be between 0 (greedy/deterministic) and 5'}), 400
+        if not (0 < top_p <= 1):
+            return jsonify({'error': 'top_p must be in (0, 1]'}), 400
+        if not (1 <= sample_count <= 32):
+            return jsonify({'error': 'sample_count must be between 1 and 32'}), 400
         
         # Load data
         df, error = load_data_file(file_path)
         if error:
             return jsonify({'error': error}), 400
         
-        if len(df) < lookback:
-            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+        required_rows = max(lookback, 2) if mode == 'future' else lookback + pred_len
+        if len(df) < required_rows:
+            extra = '' if mode == 'future' else f' + pred_len {pred_len}'
+            return jsonify({'error': f'Insufficient data: file has {len(df)} rows, need at least {required_rows} (lookback {lookback}{extra})'}), 400
         
         # Perform prediction
         if MODEL_AVAILABLE and predictor is not None:
@@ -772,10 +1005,27 @@ def predict():
                 if 'volume' in df.columns:
                     required_cols.append('volume')
                 
-                # Process time period selection
-                start_date = data.get('start_date')
-                
-                if start_date:
+                # Prediction mode: 'backtest' (predict a past window and compare with real data)
+                # or 'future' (generate candles beyond the last real data point)
+                # mode/start_date validated above
+
+                if mode == 'future':
+                    # Forward-looking prediction: use the LAST lookback real candles as input
+                    # and generate pred_len NEW candles after the most recent data point.
+                    x_df = df.iloc[-lookback:][required_cols]
+                    x_timestamp = df.iloc[-lookback:]['timestamps']
+                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
+                    future_input_ts = pd.date_range(
+                        start=df['timestamps'].iloc[-1] + time_diff,
+                        periods=pred_len,
+                        freq=time_diff
+                    )
+                    y_timestamp = pd.Series(future_input_ts, name='timestamps')
+                    prediction_type = (
+                        f"Kronos forward prediction: last {lookback} real candles as input, "
+                        f"generating {pred_len} future candles after {df['timestamps'].iloc[-1]}"
+                    )
+                elif start_date:
                     # Custom time period - fix logic: use data within selected window
                     start_dt = pd.to_datetime(start_date)
                     
@@ -828,11 +1078,14 @@ def predict():
         else:
             return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
         
-        # Prepare actual data for comparison (if exists)
+        # Prepare actual data for comparison (if exists). Forward mode has no real
+        # data to compare against, so it is skipped.
         actual_data = []
         actual_df = None
         
-        if start_date:  # Custom time period
+        if mode == 'future':
+            pass  # prediction goes beyond the last real candle
+        elif start_date:  # Custom time period
             # Fix logic: use data within selected window
             # Prediction uses first 400 data points within selected window
             # Actual data should be last 120 data points within selected window
@@ -873,7 +1126,9 @@ def predict():
                     })
         
         # Create chart - pass historical data start position
-        if start_date:
+        if mode == 'future':
+            historical_start_idx = 0
+        elif start_date:
             # Custom time period: find starting position of historical data in original df
             start_dt = pd.to_datetime(start_date)
             mask = df['timestamps'] >= start_dt
@@ -886,7 +1141,7 @@ def predict():
         
         # Prepare prediction result data - fix timestamp calculation logic
         if 'timestamps' in df.columns:
-            if start_date:
+            if start_date and mode != 'future':
                 # Custom time period: use selected window data to calculate timestamps
                 start_dt = pd.to_datetime(start_date)
                 mask = df['timestamps'] >= start_dt
@@ -951,9 +1206,16 @@ def predict():
             'success': True,
             'prediction_type': prediction_type,
             'chart': chart_json,
-            'summary': build_prediction_summary(prediction_results, x_df, pred_len, actual_data),
+            'summary': build_prediction_summary(prediction_results, x_df, pred_len, actual_data, is_forward=(mode == 'future')),
             'prediction_results': prediction_results,
             'actual_data': actual_data,
+            'prediction_params': {
+                'temperature': temperature,
+                'top_p': top_p,
+                'sample_count': sample_count,
+                'mode': mode
+            },
+            'confidence': load_eval_cache(file_path),
             'has_comparison': len(actual_data) > 0,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
