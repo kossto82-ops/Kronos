@@ -17,8 +17,10 @@ Fork de Kronos (modelo financiero) con Web UI propia (`webui/app.py`, Flask, pue
 node --check <template_extracted.js>
 
 # tests UI headless (Chrome + puppeteer-core en C:\Users\rodri\AppData\Local\Temp\opencode\uitest)
-node ui_horizon.js     # selector de horizonte
-node ui_signals.js     # señal confluente + panel multi-señal
+node ui_horizon.js      # selector de horizonte
+node ui_signals.js      # señal confluente + panel multi-señal
+node ui_paper.js        # paper-trading + comparar modelos (lento: ~5 min)
+node ui_improvements.js # timeline de acierto, banner datos viejos, guard régimen, export CSV, ETA
 ```
 
 ## Convenciones
@@ -33,6 +35,7 @@ node ui_signals.js     # señal confluente + panel multi-señal
 - **Mini en BTC: 80% (h30) / 70% (h60)** — pero solo BTC (resto 20-55%); no generaliza.
 - Ensemble mini+small+base: 70% BTC, 36% NVDA — no generaliza.
 - Modelos con fuerte sesgo bajista en activos alcistas 2024-26 (TSM 0-9%).
+- **Rendimiento evaluación (8 núcleos, CPU)**: ~7.7 s/ventana a 30 d, ~37 s a 120 d (small). `predict_batch` NO acelera en CPU (0.98×) y además rompe bit-determinismo (diff 0.0078 por redondeo en GEMM) — NO usar para evaluar; el código de evaluación es intencionadamente secuencial (da progreso por ventana). `torch.set_num_threads(8)` es más lento que el default (4) y también no-bit-idéntico. Paralelismo por hilos: 2 hilos solo 1.13× y 4 hilos CRASHEA (carrera en el rotary cache de `model/module.py` — no usar predict concurrente en el mismo predictor).
 - Ver README sección "Web UI (fork) + auditoría de acierto".
 
 ## Tests / verificación

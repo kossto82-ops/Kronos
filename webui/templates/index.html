@@ -452,6 +452,103 @@
             font-weight: 700;
         }
 
+        .confidence-timeline {
+            margin-top: 8px;
+        }
+
+        .confidence-timeline .tl-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11.5px;
+            padding: 3px 4px;
+            border-radius: 4px;
+            color: #4a5568;
+        }
+
+        .confidence-timeline .tl-hit {
+            background: #f0fff4;
+        }
+
+        .confidence-timeline .tl-miss {
+            background: #fff5f5;
+        }
+
+        .confidence-timeline .tl-date {
+            width: 74px;
+            flex-shrink: 0;
+            color: #718096;
+        }
+
+        .confidence-timeline .tl-bars {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 60px;
+        }
+
+        .confidence-timeline .tl-bar {
+            display: block;
+            height: 5px;
+            border-radius: 3px;
+            min-width: 2px;
+        }
+
+        .confidence-timeline .tl-pred {
+            background: #667eea;
+        }
+
+        .confidence-timeline .tl-act {
+            background: #a0aec0;
+        }
+
+        .confidence-timeline .tl-nums {
+            width: 130px;
+            flex-shrink: 0;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .confidence-timeline .tl-mark {
+            width: 14px;
+            flex-shrink: 0;
+            text-align: center;
+            font-weight: 700;
+        }
+
+        .confidence-timeline .tl-hit .tl-mark {
+            color: #22543d;
+        }
+
+        .confidence-timeline .tl-miss .tl-mark {
+            color: #9b2c2c;
+        }
+
+        .data-stale {
+            margin-top: 8px;
+            padding: 8px 10px;
+            background: #fffaf0;
+            border: 1px solid #feebc8;
+            border-radius: 6px;
+            color: #7b341e;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .data-stale .btn {
+            font-size: 12px;
+            padding: 4px 10px;
+        }
+
+        .summary-signal.muted {
+            opacity: 0.65;
+            filter: grayscale(0.8);
+        }
+
         #evaluate-btn[disabled] {
             opacity: 0.55;
             cursor: not-allowed;
@@ -701,6 +798,10 @@
                     <p><strong>Price Range:</strong> <span id="data-price-range">-</span></p>
                     <p><strong>Time Frequency:</strong> <span id="data-timeframe">-</span></p>
                     <p><strong>Prediction Columns:</strong> <span id="data-prediction-cols">-</span></p>
+                    <div id="data-stale" class="data-stale" style="display:none;">
+                        <span id="data-stale-text"></span>
+                        <button type="button" id="refresh-data-btn" class="btn btn-secondary">🔄 Actualizar precios</button>
+                    </div>
                 </div>
 
                 <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
@@ -775,7 +876,9 @@
                 <div id="confidence-signals" class="confidence-signals"></div>
                     <button type="button" id="evaluate-btn" class="btn btn-secondary" disabled>📊 Evaluar confianza (~3 min)</button>
                     <button type="button" id="compare-btn" class="btn btn-secondary" disabled>🏁 Comparar modelos (mini/small/base)</button>
+                    <button type="button" id="export-eval-btn" class="btn btn-secondary" disabled>⬇ CSV</button>
                     <div id="compare-result" class="confidence-signals"></div>
+                    <div id="confidence-timeline" class="confidence-timeline"></div>
                     <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ es solo la mejor del pasado en este fichero (elegirla después acertó ~41% en backtest out-of-sample).</small>
                 </div>
 
@@ -1269,9 +1372,62 @@
             document.getElementById('data-price-range').textContent = `${dataInfo.price_range.min.toFixed(4)} - ${dataInfo.price_range.max.toFixed(4)}`;
             document.getElementById('data-timeframe').textContent = dataInfo.timeframe;
             document.getElementById('data-prediction-cols').textContent = dataInfo.prediction_columns.join(', ');
-            
+
+            const stale = document.getElementById('data-stale');
+            const staleText = document.getElementById('data-stale-text');
+            if (stale && staleText) {
+                const d = dataInfo.days_old;
+                if (d === null || d === undefined) {
+                    stale.style.display = 'none';
+                } else {
+                    const last = String(dataInfo.last_date || dataInfo.end_date || '').slice(0, 10);
+                    stale.style.display = 'flex';
+                    if (d === 0) {
+                        staleText.textContent = `✅ Datos al día (hasta ${last}).`;
+                        stale.style.borderColor = '#c6f6d5';
+                        stale.style.background = '#f0fff4';
+                        stale.style.color = '#22543d';
+                    } else if (d >= 3) {
+                        staleText.textContent = `⚠ Datos hasta ${last}: ${d} días desactualizados. Las predicciones y el paper-trading se basan en datos viejos.`;
+                        stale.style.borderColor = '#fed7d7';
+                        stale.style.background = '#fff5f5';
+                        stale.style.color = '#9b2c2c';
+                    } else {
+                        staleText.textContent = `Datos hasta ${last} (${d} día${d > 1 ? 's' : ''} sin actualizar).`;
+                        stale.style.borderColor = '#feebc8';
+                        stale.style.background = '#fffaf0';
+                        stale.style.color = '#7b341e';
+                    }
+                }
+            }
+
             // Initialize time window slider
             initializeTimeWindowSlider(dataInfo);
+        }
+
+        async function refreshCurrentData() {
+            if (!currentDataFile) return;
+            const m = currentDataFile.split(/[\\/]/).pop().match(/^([^_]+)_(crypto|us)_([0-9a-z]+)\.csv$/i);
+            const btn = document.getElementById('refresh-data-btn');
+            if (!m) {
+                showStatus('warning', 'No sé actualizar este fichero automáticamente; usa el formulario de descarga.');
+                return;
+            }
+            if (btn) btn.disabled = true;
+            try {
+                showStatus('info', `Actualizando ${m[1]}…`);
+                const r = await axios.post('/api/fetch-data', {
+                    source: m[2].toLowerCase(),
+                    symbol: m[1],
+                    interval: m[3]
+                });
+                showStatus('success', r.data.message || 'Datos actualizados');
+                await loadData();
+            } catch (e) {
+                showStatus('error', `Actualizar falló: ${e.response?.data?.error || e.message}`);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
                     // Time window slider related variables
@@ -1596,12 +1752,12 @@
                 }
             }
 
-            renderPredictionSignal(result.signal);
+            renderPredictionSignal(result.signal, result.confidence);
             if (result.paper_record) refreshPaperLog();
         }
 
         // Render the live confluence signal (model vs 60-day trend) in the summary
-        function renderPredictionSignal(signal) {
+        function renderPredictionSignal(signal, confidence) {
             const el = document.getElementById('summary-signal');
             if (!el) return;
             if (!signal || typeof signal.model_dir !== 'number') {
@@ -1621,6 +1777,10 @@
                 verdict = '⚠ el modelo contradice la tendencia de 60 días';
             } else {
                 verdict = 'señal mixta (alguna dirección plana)';
+            }
+            if (confidence && confidence.verdict === 'bad') {
+                cls += ' muted';
+                verdict = 'evaluación 🔴 baja en este fichero: no te fíes de la señal — ' + verdict;
             }
             el.className = cls;
             el.style.display = 'block';
@@ -1714,6 +1874,8 @@
                 el.textContent = 'Sin evaluar';
                 if (det) det.textContent = '';
                 if (sigEl) sigEl.textContent = '';
+                renderConfidenceTimeline(null);
+                updateExportBtn();
                 return;
             }
             currentConfidence = result;
@@ -1737,6 +1899,62 @@
                     sigEl.textContent = '';
                 }
             }
+            renderConfidenceTimeline(result);
+            updateExportBtn();
+        }
+
+        // Mini timeline of walk-forward windows: predicted vs actual, hit/miss
+        function renderConfidenceTimeline(result) {
+            const el = document.getElementById('confidence-timeline');
+            if (!el) return;
+            const wins = (result && result.windows) || [];
+            if (!wins.length) {
+                el.innerHTML = '';
+                return;
+            }
+            const maxAbs = Math.max(1, ...wins.map(w =>
+                Math.max(Math.abs(w.pred_chg_pct || 0), Math.abs(w.actual_chg_pct || 0))));
+            const sgn = v => `${v > 0 ? '+' : ''}${Number(v || 0).toFixed(1)}%`;
+            el.innerHTML = wins.map(w => {
+                const pw = Math.min(100, Math.abs(w.pred_chg_pct || 0) / maxAbs * 100);
+                const aw = Math.min(100, Math.abs(w.actual_chg_pct || 0) / maxAbs * 100);
+                const cls = w.hit ? 'tl-hit' : 'tl-miss';
+                const title = `${w.start_date || '?'} → ${w.end_date || '?'} · modelo ${sgn(w.pred_chg_pct)} vs real ${sgn(w.actual_chg_pct)}`;
+                return `<div class="tl-row ${cls}" title="${escapeHtml(title)}">
+                    <span class="tl-date">${escapeHtml(w.end_date || '')}</span>
+                    <span class="tl-bars">
+                        <span class="tl-bar tl-pred" style="width:${pw.toFixed(1)}%"></span>
+                        <span class="tl-bar tl-act" style="width:${aw.toFixed(1)}%"></span>
+                    </span>
+                    <span class="tl-nums">${sgn(w.pred_chg_pct)} / ${sgn(w.actual_chg_pct)}</span>
+                    <span class="tl-mark">${w.hit ? '✓' : '✗'}</span>
+                </div>`;
+            }).join('');
+        }
+
+        function updateExportBtn() {
+            const btn = document.getElementById('export-eval-btn');
+            if (btn) btn.disabled = !(currentConfidence && currentConfidence.windows && currentConfidence.windows.length);
+        }
+
+        function exportEvalCsv() {
+            const r = currentConfidence;
+            if (!r || !r.windows || !r.windows.length) return;
+            const cols = ['start_date', 'end_date', 'pred_chg_pct', 'actual_chg_pct', 'hit',
+                'mom60_hit', 'ols60_hit', 'inv_hit', 'mape_end', 'naive_mape_end'];
+            const head = ['start_date', 'end_date', 'pred_pct', 'actual_pct', 'model_hit',
+                'mom60_hit', 'ols60_hit', 'inv_hit', 'mape_end', 'naive_mape_end'];
+            const lines = [head.join(',')].concat(r.windows.map(w =>
+                cols.map(c => (w[c] === undefined || w[c] === null) ? '' : w[c]).join(',')));
+            const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+            const a = document.createElement('a');
+            const sym = String(r.file_path || 'eval').split(/[\\/]/).pop().replace(/\.csv$/i, '');
+            a.href = URL.createObjectURL(blob);
+            a.download = `eval_${sym}_${r.pred_len}d_${(r.evaluated_at || '').slice(0, 10)}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(a.href);
         }
 
         async function refreshConfidence(filePath) {
@@ -1782,8 +2000,16 @@
                     if (st.status === 'running') {
                         const total = st.total || '?';
                         const cur = st.total ? Math.min(st.progress + 1, st.total) : st.progress;
-                        el.textContent = `Evaluando… ventana ${cur}/${total}`;
-                        if (det) det.textContent = 'Cada ventana tarda ~40 s en CPU. Puedes seguir usando la web mientras tanto.';
+                        let eta = '';
+                        if (st.started_at && st.progress > 0 && st.total) {
+                            const elapsed = Date.now() / 1000 - st.started_at;
+                            const secs = Math.max(1, Math.round(elapsed / st.progress * (st.total - st.progress)));
+                            eta = secs >= 60
+                                ? ` · ETA ${Math.floor(secs / 60)} min ${secs % 60} s`
+                                : ` · ETA ${secs} s`;
+                        }
+                        el.textContent = `Evaluando… ventana ${cur}/${total}${eta}`;
+                        if (det) det.textContent = 'Cada ventana tarda ~8 s (30 d) a ~40 s (120 d) en CPU. Puedes seguir usando la web mientras tanto.';
                     } else if (st.status === 'done') {
                         renderConfidence(st.result);
                         break;
@@ -2060,6 +2286,8 @@
             document.getElementById('load-data-btn').addEventListener('click', loadData);
         document.getElementById('evaluate-btn').addEventListener('click', runEvaluation);
         document.getElementById('compare-btn').addEventListener('click', runCompare);
+        document.getElementById('export-eval-btn').addEventListener('click', exportEvalCsv);
+        document.getElementById('refresh-data-btn').addEventListener('click', refreshCurrentData);
             
             // Download data button
             document.getElementById('fetch-data-btn').addEventListener('click', fetchData);

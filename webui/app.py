@@ -9,6 +9,7 @@ from flask_cors import CORS
 import sys
 import warnings
 import datetime
+import time
 import requests
 import threading
 import hashlib
@@ -642,13 +643,21 @@ def load_data():
             warnings.append('The file has no date column: synthetic hourly timestamps were generated, dates shown are NOT real')
         if df.attrs.get('dropped_rows'):
             warnings.append(f"Removed {df.attrs['dropped_rows']} rows with invalid values")
-        
+
+        last_date = None
+        days_old = None
+        if 'timestamps' in df.columns and not df.attrs.get('synthetic_timestamps'):
+            last_date = pd.Timestamp(df['timestamps'].max())
+            days_old = max(0, (pd.Timestamp.now().normalize() - last_date.normalize()).days)
+
         # Return data information
         data_info = {
             'rows': len(df),
             'columns': list(df.columns),
             'start_date': df['timestamps'].min().isoformat() if 'timestamps' in df.columns else 'N/A',
             'end_date': df['timestamps'].max().isoformat() if 'timestamps' in df.columns else 'N/A',
+            'last_date': last_date.isoformat() if last_date is not None else None,
+            'days_old': days_old,
             'price_range': {
                 'min': float(df[['open', 'high', 'low', 'close']].min().min()),
                 'max': float(df[['open', 'high', 'low', 'close']].max().max())
@@ -783,7 +792,7 @@ def build_prediction_summary(prediction_results, x_df, pred_len, actual_data=Non
 # compares direction hit-rate and end error against "do nothing" (last price).
 
 EVAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'evaluation_results')
-EVAL_STATE = {'status': 'idle', 'progress': 0, 'total': 0, 'file_path': None, 'result': None, 'error': None}
+EVAL_STATE = {'status': 'idle', 'progress': 0, 'total': 0, 'started_at': None, 'file_path': None, 'result': None, 'error': None}
 EVAL_CACHE = {}
 
 
@@ -867,6 +876,7 @@ def _run_evaluation(file_path, lookback, pred_len, n_windows):
             return
         n = max(1, min(n_windows, n_max))
         EVAL_STATE['total'] = n
+        EVAL_STATE['started_at'] = time.time()
         pred = predictor
         cols = ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else [])
         windows = []
@@ -968,7 +978,7 @@ def evaluate():
         if cached and not force:
             return jsonify({'started': False, 'cached': True, 'result': cached})
 
-        EVAL_STATE.update(status='running', progress=0, total=0, file_path=file_path, result=None, error=None)
+        EVAL_STATE.update(status='running', progress=0, total=0, started_at=None, file_path=file_path, result=None, error=None)
         thread = threading.Thread(target=_run_evaluation, args=(file_path, lookback, pred_len, n_windows), daemon=True)
         thread.start()
         return jsonify({'started': True, 'file_path': file_path})
@@ -1151,7 +1161,7 @@ def _run_compare(file_path, lookback, pred_len, n_windows):
             prd = KronosPredictor(mdl, tok, device='cpu', max_context=cfg['context_length'])
             hits = 0
             per_window = []
-            for i, w in enumerate(windows):
+            for w in windows:
                 out = prd.predict(df=w['x_df'], x_timestamp=w['x_ts'], y_timestamp=w['y_ts'],
                                   pred_len=pred_len, T=0.0, top_p=0.9, sample_count=1, verbose=False)
                 p = out['close'].values.astype(float)
