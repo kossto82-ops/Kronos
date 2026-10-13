@@ -78,3 +78,5 @@ tmp/
 # Generated prediction / evaluation artifacts
 webui/prediction_results/
 webui/evaluation_results/
+
+webui/paper_trading_log.json

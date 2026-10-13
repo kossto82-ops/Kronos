@@ -40,6 +40,7 @@ def add_no_cache(response):
 tokenizer = None
 model = None
 predictor = None
+CURRENT_MODEL_KEY = None
 
 # Available model configurations
 AVAILABLE_MODELS = {
@@ -994,6 +995,245 @@ def evaluate_cache():
     return jsonify({'cached': result is not None, 'result': result})
 
 
+# --- Paper-trading log: record future predictions, verify against real data later ---
+
+PAPER_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'paper_trading_log.json')
+
+
+def _load_paper_log():
+    if not os.path.exists(PAPER_LOG_PATH):
+        return []
+    try:
+        with open(PAPER_LOG_PATH, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+        return records if isinstance(records, list) else []
+    except Exception:
+        return []
+
+
+def _save_paper_log(records):
+    try:
+        with open(PAPER_LOG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _verify_paper_records(records):
+    """Fill actual outcome for pending records whose prediction end date is now real data."""
+    pending = [r for r in records if not r.get('verified') and r.get('pred_end_date')]
+    by_file = {}
+    for r in pending:
+        by_file.setdefault(r['file_path'], []).append(r)
+    changed = False
+    for fp, recs in by_file.items():
+        df, error = load_data_file(fp)
+        if error or 'timestamps' not in df.columns:
+            continue
+        ts = pd.to_datetime(df['timestamps'])
+        closes = df['close'].astype(float).values
+        for r in recs:
+            try:
+                end_dt = pd.to_datetime(r['pred_end_date'])
+                mask = ts >= end_dt
+                if not bool(mask.any()):
+                    continue
+                idx = ts[mask].index[0]
+                pos = ts.index.get_loc(idx)
+                base = float(r.get('base_price') or 0)
+                if not base:
+                    continue
+                actual_close = float(closes[pos])
+                actual_chg = (actual_close - base) / base * 100.0
+                r['verified'] = True
+                r['actual_date'] = str(ts.iloc[pos])[:10]
+                r['actual_close'] = round(actual_close, 4)
+                r['actual_chg'] = round(actual_chg, 2)
+                r['actual_dir'] = _direction(actual_chg)
+                r['hit'] = int(r.get('pred_dir') is not None and r['pred_dir'] == r['actual_dir']) if r.get('pred_dir') else 0
+                r['verified_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+                changed = True
+            except Exception:
+                continue
+    if changed:
+        _save_paper_log(records)
+    return records
+
+
+@app.route('/api/paper-log', methods=['GET'])
+def paper_log():
+    records = _verify_paper_records(_load_paper_log())
+    records = sorted(records, key=lambda r: r.get('created_at') or '', reverse=True)
+    verified = [r for r in records if r.get('verified')]
+    hits = sum(int(r.get('hit') or 0) for r in verified)
+    stats = {
+        'total': len(records),
+        'pending': len(records) - len(verified),
+        'verified': len(verified),
+        'hits': hits,
+        'hit_rate': round(hits / len(verified), 3) if verified else None,
+    }
+    return jsonify({'records': records, 'stats': stats})
+
+
+@app.route('/api/paper-log/<record_id>', methods=['DELETE'])
+def paper_log_delete(record_id):
+    records = [r for r in _load_paper_log() if r.get('id') != record_id]
+    _save_paper_log(records)
+    return jsonify({'ok': True, 'remaining': len(records)})
+
+
+# --- Model comparison: walk-forward mini vs small vs base on the same windows ---
+
+COMPARE_STATE = {'status': 'idle', 'progress': 0, 'total': 0, 'current_model': None,
+                 'result': None, 'error': None}
+
+
+def _compare_cache_path(file_path, lookback, pred_len):
+    try:
+        st = os.stat(file_path)
+        key = f"{os.path.abspath(file_path)}|{st.st_size}|{int(st.st_mtime)}|{lookback}|{pred_len}|cmp"
+    except OSError:
+        key = f"{os.path.abspath(file_path)}|{lookback}|{pred_len}|cmp"
+    name = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(EVAL_DIR, name + '.json')
+
+
+def load_compare_cache(file_path, lookback, pred_len):
+    path = _compare_cache_path(file_path, lookback, pred_len)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _run_compare(file_path, lookback, pred_len, n_windows):
+    try:
+        df, error = load_data_file(file_path)
+        if error:
+            COMPARE_STATE.update(status='error', error=error)
+            return
+        n_max = (len(df) - lookback) // pred_len
+        if n_max < 1:
+            COMPARE_STATE.update(status='error', error=(
+                f'Insufficient data: need at least {lookback + pred_len} rows, file has {len(df)}'))
+            return
+        n = max(1, min(n_windows, n_max))
+        cols = ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else [])
+
+        windows = []
+        mom60_hits = 0
+        for i in range(n):
+            end_idx = len(df) - (i + 1) * pred_len
+            x_df = df.iloc[end_idx - lookback:end_idx][cols].copy()
+            x_ts = df['timestamps'].iloc[end_idx - lookback:end_idx].reset_index(drop=True)
+            y_ts = df['timestamps'].iloc[end_idx:end_idx + pred_len].reset_index(drop=True)
+            base = float(df['close'].iloc[end_idx - 1])
+            a_end = float(df['close'].iloc[end_idx + pred_len - 1])
+            act_dir = _direction((a_end - base) / base * 100.0)
+            closes = df['close'].iloc[end_idx - lookback:end_idx].values.astype(float)
+            mom_dir, _ = _trend_signals(closes)
+            mom60_hits += int(mom_dir == act_dir)
+            windows.append({'x_df': x_df, 'x_ts': x_ts, 'y_ts': y_ts, 'act_dir': act_dir})
+
+        model_keys = ['kronos-mini', 'kronos-small', 'kronos-base']
+        COMPARE_STATE.update(total=len(model_keys) * n, progress=0, current_model=None)
+
+        results_models = {}
+        for mk in model_keys:
+            cfg = AVAILABLE_MODELS[mk]
+            COMPARE_STATE['current_model'] = cfg['name']
+            tok = KronosTokenizer.from_pretrained(cfg['tokenizer_id'])
+            mdl = Kronos.from_pretrained(cfg['model_id'])
+            prd = KronosPredictor(mdl, tok, device='cpu', max_context=cfg['context_length'])
+            hits = 0
+            per_window = []
+            for i, w in enumerate(windows):
+                out = prd.predict(df=w['x_df'], x_timestamp=w['x_ts'], y_timestamp=w['y_ts'],
+                                  pred_len=pred_len, T=0.0, top_p=0.9, sample_count=1, verbose=False)
+                p = out['close'].values.astype(float)
+                base = float(w['x_df']['close'].iloc[-1])
+                pred_dir = _direction((float(p[-1]) - base) / base * 100.0)
+                ok = int(pred_dir == w['act_dir'])
+                hits += ok
+                per_window.append({'hit': ok, 'pred_dir': pred_dir, 'act_dir': w['act_dir']})
+                COMPARE_STATE['progress'] += 1
+            results_models[mk] = {
+                'key': mk,
+                'name': cfg['name'],
+                'params': cfg['params'],
+                'hits': hits,
+                'n': n,
+                'rate': round(hits / n, 3),
+                'windows': per_window,
+            }
+            del prd, mdl, tok
+
+        best = max(results_models, key=lambda k: results_models[k]['rate'])
+        result = {
+            'file_path': file_path,
+            'lookback': lookback,
+            'pred_len': pred_len,
+            'n_windows': n,
+            'models': results_models,
+            'mom60': {'hits': mom60_hits, 'n': n, 'rate': round(mom60_hits / n, 3)},
+            'best': best,
+            'best_rate': results_models[best]['rate'],
+            'recommended': best if results_models[best]['rate'] >= 0.55 else None,
+            'evaluated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        }
+        try:
+            os.makedirs(EVAL_DIR, exist_ok=True)
+            with open(_compare_cache_path(file_path, lookback, pred_len), 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        COMPARE_STATE.update(status='done', result=result, error=None, current_model=None)
+    except Exception as e:
+        COMPARE_STATE.update(status='error', error=str(e), current_model=None)
+
+
+@app.route('/api/compare-models', methods=['POST'])
+def compare_models():
+    try:
+        data = request.get_json() or {}
+        file_path = data.get('file_path')
+        force = bool(data.get('force', False))
+        lookback = int(data.get('lookback', 400))
+        pred_len = int(data.get('pred_len', 120))
+        n_windows = int(data.get('n_windows', 4))
+
+        if not file_path:
+            return jsonify({'error': 'File path cannot be empty'}), 400
+        if not MODEL_AVAILABLE:
+            return jsonify({'error': 'Kronos model library not available'}), 400
+        if not (0 < lookback <= 4096) or not (0 < pred_len <= 1024) or not (1 <= n_windows <= 12):
+            return jsonify({'error': 'Invalid comparison parameters'}), 400
+        if COMPARE_STATE.get('status') == 'running':
+            return jsonify({'error': 'A comparison is already running'}), 409
+
+        cached = load_compare_cache(file_path, lookback, pred_len)
+        if cached and not force:
+            return jsonify({'started': False, 'cached': True, 'result': cached})
+
+        COMPARE_STATE.update(status='running', progress=0, total=0, current_model=None,
+                             result=None, error=None)
+        thread = threading.Thread(target=_run_compare, args=(file_path, lookback, pred_len, n_windows),
+                                  daemon=True)
+        thread.start()
+        return jsonify({'started': True, 'file_path': file_path})
+    except Exception as e:
+        return jsonify({'error': f'Comparison failed: {str(e)}'}), 500
+
+
+@app.route('/api/compare-status', methods=['GET'])
+def compare_status():
+    return jsonify(COMPARE_STATE)
+
+
 @app.route('/api/predict', methods=['POST'])
 def predict():
     """Perform prediction"""
@@ -1240,6 +1480,39 @@ def predict():
         except Exception:
             signal = None
 
+        paper_record = None
+        if mode == 'future':
+            try:
+                records = _load_paper_log()
+                base_px = float(df['close'].iloc[-1])
+                end_px = float(prediction_results[-1]['close'])
+                pred_chg = (end_px - base_px) / base_px * 100.0
+                rec = {
+                    'id': datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'),
+                    'created_at': datetime.datetime.now().isoformat(timespec='seconds'),
+                    'file_path': file_path,
+                    'symbol': os.path.splitext(os.path.basename(file_path))[0],
+                    'model': CURRENT_MODEL_KEY or 'unknown',
+                    'lookback': lookback,
+                    'pred_len': pred_len,
+                    'temperature': temperature,
+                    'top_p': top_p,
+                    'sample_count': sample_count,
+                    'last_real_date': str(df['timestamps'].iloc[-1])[:10],
+                    'pred_end_date': str(future_timestamps[-1])[:10] if len(future_timestamps) else None,
+                    'base_price': round(base_px, 4),
+                    'pred_end_price': round(end_px, 4),
+                    'pred_chg': round(pred_chg, 2),
+                    'pred_dir': _direction(pred_chg),
+                    'verified': False,
+                }
+                records.insert(0, rec)
+                records = _verify_paper_records(records)
+                _save_paper_log(records)
+                paper_record = records[0] if records else rec
+            except Exception as e:
+                print(f"Failed to record paper-trading entry: {e}")
+
         # Save prediction results to file
         try:
             save_prediction_results(
@@ -1275,6 +1548,7 @@ def predict():
             },
             'confidence': load_eval_cache(file_path, lookback, pred_len),
             'signal': signal,
+            'paper_record': paper_record,
             'has_comparison': len(actual_data) > 0,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
@@ -1285,7 +1559,7 @@ def predict():
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
     """Load Kronos model"""
-    global tokenizer, model, predictor
+    global tokenizer, model, predictor, CURRENT_MODEL_KEY
     
     try:
         if not MODEL_AVAILABLE:
@@ -1306,6 +1580,7 @@ def load_model():
         
         # Create predictor
         predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
+        CURRENT_MODEL_KEY = model_key
         
         return jsonify({
             'success': True,

@@ -424,6 +424,34 @@
             color: #7b341e;
         }
 
+        .paper-section {
+            margin-top: 16px;
+            background: #f7fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 16px 20px;
+        }
+
+        .paper-section h3 {
+            color: #4a5568;
+            margin-bottom: 8px;
+            font-size: 1rem;
+        }
+
+        .paper-section .badge-pending {
+            color: #718096;
+        }
+
+        .paper-section .badge-hit {
+            color: #22543d;
+            font-weight: 700;
+        }
+
+        .paper-section .badge-miss {
+            color: #9b2c2c;
+            font-weight: 700;
+        }
+
         #evaluate-btn[disabled] {
             opacity: 0.55;
             cursor: not-allowed;
@@ -746,6 +774,8 @@
                     <div id="confidence-detail" class="confidence-detail"></div>
                 <div id="confidence-signals" class="confidence-signals"></div>
                     <button type="button" id="evaluate-btn" class="btn btn-secondary" disabled>📊 Evaluar confianza (~3 min)</button>
+                    <button type="button" id="compare-btn" class="btn btn-secondary" disabled>🏁 Comparar modelos (mini/small/base)</button>
+                    <div id="compare-result" class="confidence-signals"></div>
                     <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ es solo la mejor del pasado en este fichero (elegirla después acertó ~41% en backtest out-of-sample).</small>
                 </div>
 
@@ -788,7 +818,31 @@
 <div id="prediction-line-chart"></div>
 <div id="summary-comparison" class="summary-comparison"></div>
 </div>
-                
+
+<!-- Paper-trading: future predictions verified against real data -->
+<div id="paper-section" class="paper-section">
+    <h3>🗒️ Paper-trading — predicciones futuras verificadas con datos reales</h3>
+    <div id="paper-stats" class="confidence-detail"></div>
+    <div style="max-height: 280px; overflow-y: auto;">
+        <table class="comparison-table" id="paper-table">
+            <thead>
+                <tr>
+                    <th>Predicha</th>
+                    <th>Hasta</th>
+                    <th>Activo</th>
+                    <th>Modelo</th>
+                    <th>Velas</th>
+                    <th>Predicción</th>
+                    <th>Real</th>
+                    <th>Resultado</th>
+                </tr>
+            </thead>
+            <tbody id="paper-tbody"></tbody>
+        </table>
+    </div>
+    <div id="paper-empty" class="form-text">Aún no hay predicciones futuras registradas. Haz una predicción en modo «futuro»: quedará registrada y se verificará sola cuando esos datos existan de verdad.</div>
+</div>
+
                 <!-- Comparison Analysis -->
                 <div id="comparison-section" class="comparison-section" style="display: none;">
                     <h3>📊 Prediction vs Actual Data Comparison</h3>
@@ -847,6 +901,7 @@
         let currentDataFile = null;
         let currentConfidence = null;
         let evaluatePolling = false;
+        let comparePolling = false;
         let currentDataInfo = null;
         let availableModels = [];
         let modelLoaded = false;
@@ -1542,6 +1597,7 @@
             }
 
             renderPredictionSignal(result.signal);
+            if (result.paper_record) refreshPaperLog();
         }
 
         // Render the live confluence signal (model vs 60-day trend) in the summary
@@ -1632,8 +1688,12 @@
         // --- Confidence panel (walk-forward self-evaluation) ---
         function updateEvaluateBtn() {
             const btn = document.getElementById('evaluate-btn');
-            if (!btn) return;
-            btn.disabled = evaluatePolling || !currentDataFile || !modelLoaded;
+            if (btn) btn.disabled = evaluatePolling || comparePolling || !currentDataFile || !modelLoaded;
+            const cbtn = document.getElementById('compare-btn');
+            if (cbtn) {
+                cbtn.disabled = evaluatePolling || comparePolling || !currentDataFile;
+                cbtn.textContent = comparePolling ? '🏁 Comparando… (mini→small→base)' : '🏁 Comparar modelos (mini/small/base)';
+            }
         }
 
         function confidenceLabel(verdict) {
@@ -1742,6 +1802,136 @@
                 det.textContent = `Fallo: ${error.response?.data?.error || error.message}`;
             } finally {
                 evaluatePolling = false;
+                updateEvaluateBtn();
+            }
+        }
+
+        // --- Paper-trading log ---
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+                ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        function renderPaperLog(data) {
+            const tbody = document.getElementById('paper-tbody');
+            const statsEl = document.getElementById('paper-stats');
+            const emptyEl = document.getElementById('paper-empty');
+            if (!tbody) return;
+            const records = (data && data.records) || [];
+            const stats = (data && data.stats) || {};
+            if (statsEl) {
+                if (!records.length) {
+                    statsEl.textContent = '';
+                } else {
+                    let t = `${stats.total} predicciones · ${stats.pending} pendientes · verificadas ${stats.hits}/${stats.verified}`;
+                    if (stats.hit_rate != null) t += ` (${Math.round(stats.hit_rate * 100)}% de acierto)`;
+                    statsEl.textContent = t;
+                }
+            }
+            if (emptyEl) emptyEl.style.display = records.length ? 'none' : 'block';
+            tbody.innerHTML = records.map(r => {
+                const model = String(r.model || '').replace('kronos-', '');
+                const predTxt = `${r.pred_chg > 0 ? '+' : ''}${r.pred_chg}% ${r.pred_dir > 0 ? '↑' : (r.pred_dir < 0 ? '↓' : '→')}`;
+                let realTxt = '—';
+                let resTxt = '<span class="badge-pending">⏳ pendiente</span>';
+                if (r.verified) {
+                    realTxt = `${r.actual_chg > 0 ? '+' : ''}${r.actual_chg}% (${r.actual_date})`;
+                    resTxt = !r.pred_dir
+                        ? '<span class="badge-pending">→ plano</span>'
+                        : (r.hit ? '<span class="badge-hit">✓ acertó</span>' : '<span class="badge-miss">✗ falló</span>');
+                }
+                return `<tr>
+                    <td>${escapeHtml(r.created_at || '')}</td>
+                    <td>${escapeHtml(r.pred_end_date || '')}</td>
+                    <td>${escapeHtml(r.symbol || '')}</td>
+                    <td>${escapeHtml(model)}</td>
+                    <td>${Number(r.pred_len) || ''}</td>
+                    <td>${escapeHtml(predTxt)}</td>
+                    <td>${escapeHtml(realTxt)}</td>
+                    <td>${resTxt}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function refreshPaperLog() {
+            try {
+                const r = await axios.get('/api/paper-log');
+                renderPaperLog(r.data);
+            } catch (e) {
+                console.error('Failed to load paper log:', e);
+            }
+        }
+
+        // --- Model comparison (mini vs small vs base on identical windows) ---
+        function renderCompare(result) {
+            const el = document.getElementById('compare-result');
+            if (!el || !result || !result.models) return;
+            const order = ['kronos-mini', 'kronos-small', 'kronos-base'];
+            const rows = order.filter(k => result.models[k]).map(k => {
+                const m = result.models[k];
+                const pct = Math.round(m.rate * 100);
+                const star = k === result.best ? ' ★' : '';
+                const cls = m.rate >= 0.55 ? 'best' : '';
+                return `<span class="${cls}">${escapeHtml(m.name)} ${m.hits}/${m.n} (${pct}%)${star}</span>`;
+            });
+            if (result.mom60) {
+                rows.push(`<span>tendencia 60d ${result.mom60.hits}/${result.mom60.n} (${Math.round(result.mom60.rate * 100)}%)</span>`);
+            }
+            let rec;
+            const bestM = result.models[result.best];
+            const nW = result.n_windows || 0;
+            if (bestM && bestM.rate >= 0.55 && nW >= 6) {
+                rec = ` → recomendado aquí: <strong>${escapeHtml(bestM.name)}</strong> (${Math.round(bestM.rate * 100)}%, n=${nW})`;
+            } else if (bestM && bestM.rate >= 0.55) {
+                rec = ` → mejor ${escapeHtml(bestM.name)} con ${Math.round(bestM.rate * 100)}% pero solo n=${nW} ventanas: muestra insuficiente para recomendar`;
+            } else {
+                rec = ' → ningún modelo llega a 55% en este fichero; no te fíes de la dirección.';
+            }
+            el.innerHTML = `Comparación (mismas ventanas, T=0, ${result.pred_len} velas): ` + rows.join(' · ') + rec;
+        }
+
+        async function runCompare() {
+            if (!currentDataFile || comparePolling) return;
+            comparePolling = true;
+            updateEvaluateBtn();
+            const el = document.getElementById('compare-result');
+            const pl = currentPredLen();
+            const nWindows = pl >= 120 ? 4 : (pl >= 60 ? 8 : 10);
+            try {
+                try {
+                    const start = await axios.post('/api/compare-models', {
+                        file_path: currentDataFile,
+                        lookback: 400,
+                        pred_len: pl,
+                        n_windows: nWindows
+                    });
+                    if (start.data.cached && start.data.result) {
+                        renderCompare(start.data.result);
+                        return;
+                    }
+                } catch (e) {
+                    if (!e.response || e.response.status !== 409) throw e;
+                }
+                while (true) {
+                    await new Promise(r => setTimeout(r, 2500));
+                    const st = (await axios.get('/api/compare-status')).data;
+                    if (st.status === 'running') {
+                        const total = st.total || '?';
+                        el.innerHTML = `Comparando… ${escapeHtml(st.current_model || '')} ventana ${st.progress}/${total}`;
+                    } else if (st.status === 'done') {
+                        renderCompare(st.result);
+                        break;
+                    } else if (st.status === 'error') {
+                        el.innerHTML = `Error: ${escapeHtml(st.error || 'error desconocido')}`;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            } catch (error) {
+                el.innerHTML = `Fallo: ${escapeHtml(error.response?.data?.error || error.message)}`;
+            } finally {
+                comparePolling = false;
                 updateEvaluateBtn();
             }
         }
@@ -1869,6 +2059,7 @@
             // Load data button
             document.getElementById('load-data-btn').addEventListener('click', loadData);
         document.getElementById('evaluate-btn').addEventListener('click', runEvaluation);
+        document.getElementById('compare-btn').addEventListener('click', runCompare);
             
             // Download data button
             document.getElementById('fetch-data-btn').addEventListener('click', fetchData);
@@ -1915,6 +2106,8 @@
             updateHorizonHints();
             if (currentDataFile) refreshConfidence(currentDataFile);
         });
+            updateHorizonHints();
+            refreshPaperLog();
         }
 
         // Display status information
