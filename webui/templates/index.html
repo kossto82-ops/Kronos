@@ -746,7 +746,7 @@
                     <div id="confidence-detail" class="confidence-detail"></div>
                 <div id="confidence-signals" class="confidence-signals"></div>
                     <button type="button" id="evaluate-btn" class="btn btn-secondary" disabled>📊 Evaluar confianza (~3 min)</button>
-                    <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ marca la que mejor acierta en este fichero.</small>
+                    <small class="form-text" id="confidence-hint">Auto-evaluación walk-forward: predice las últimas ventanas de 120 velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ es solo la mejor del pasado en este fichero (elegirla después acertó ~41% en backtest out-of-sample).</small>
                 </div>
 
                 <div class="form-group">
@@ -1311,7 +1311,7 @@
             const fh = document.getElementById('fetch-hint');
             if (fh) fh.textContent = `Daily recommended (needs >= ${ws} candles for a full window)`;
             const ch = document.getElementById('confidence-hint');
-            if (ch) ch.textContent = `Auto-evaluación walk-forward: predice las últimas ventanas de ${pl} velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ marca la que mejor acierta en este fichero.`;
+            if (ch) ch.textContent = `Auto-evaluación walk-forward: predice las últimas ventanas de ${pl} velas (T=0, determinista) y compara 4 señales contra lo real — modelo, tendencia 60d, recta 60d y modelo invertido. El ★ es solo la mejor del pasado en este fichero (elegirla después acertó ~41% en backtest out-of-sample).`;
             updateModeHint();
         }
 
