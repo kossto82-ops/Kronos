@@ -28,9 +28,11 @@ node ui_signals.js     # señal confluente + panel multi-señal
 - Determinismo: para evaluaciones usar siempre `T=0` (greedy). `T>0` es aleatorio e irreproducible.
 - Cache de evaluación: clave = archivo|size|mtime|lookback|pred_len (webui/evaluation_results/, gitignored).
 
-## Hechos medidos (no re-derivar, costó ~40 min de CPU)
-- Dirección modelo (T=0 small): 41-46% pooled; mom60 55-56%; ★ OOS 41%.
-- Modelos con fuerte sesgo bajista 2024-26. Ensemble mini+small+base no mejora.
+## Hechos medidos (no re-derivar, costó ~60 min de CPU)
+- Dirección modelo (T=0): small pooled 41-46%, mini pooled 42-46%; mom60 55-56%; ★ OOS 41%.
+- **Mini en BTC: 80% (h30) / 70% (h60)** — pero solo BTC (resto 20-55%); no generaliza.
+- Ensemble mini+small+base: 70% BTC, 36% NVDA — no generaliza.
+- Modelos con fuerte sesgo bajista en activos alcistas 2024-26 (TSM 0-9%).
 - Ver README sección "Web UI (fork) + auditoría de acierto".
 
 ## Tests / verificación

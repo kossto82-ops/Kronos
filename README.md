@@ -327,15 +327,17 @@ Ventanas walk-forward (BTC 2024-26 + NVDA/TSM/PLTR/AAPL/ETH/SOL):
 
 | Señal | h=30 (n=104) | h=60 (n=50) |
 |---|---|---|
-| Modelo Kronos | 41% | 46% |
+| Modelo Kronos-small | 41% | 46% |
+| Modelo Kronos-mini | 46% | 42% |
 | Tendencia 60d (`mom60`) | **55%** | **56%** |
 | Recta 60d (OLS) | 52% | 48% |
-| Invertir el modelo | 57% | 52% |
+| Invertir el modelo (small) | 57% | 52% |
 
-- **El modelo solo NO llega al 55%** (41-46%; sesgo bajista: en activos alcistas como TSM acierta 0-9%).
-- **La tendencia de 60 días sí roza el 55-56% pooled**, pero varía mucho por activo y ventana: no es un consejo de inversión.
+- **El modelo solo NO llega al 55% pooled** (41-46%; sesgo bajista: en activos alcistas como TSM acierta 0-9%).
+- **Ensembling** mini+small+base (voto mayoritario): 70% en BTC pero 36% en NVDA — no generaliza.
+- **Kronos-mini en BTC: 80% (h30) / 70% (h60)** — impresionante pero **específico de BTC** (en el resto de activos mini cae a 20-55%); no sirve como señal global.
+- **La tendencia de 60 días sí roza el 55-56% pooled**, pero varía por activo y ventana: no es un consejo de inversión.
 - **Elegir "la mejor señal del pasado" (★) NO generaliza**: backtest out-of-sample de esa regla = 41%. El ★ del panel es solo memoria histórica, no pronóstico.
-- Ensembling mini+small+base (voto mayoritario) no salva al modelo (ver `ensemble_lab` en la sesión de auditoría).
 
 Conclusión: úsalo para **explorar y medir**, no para operar en real. El panel de confianza existe precisamente para que cada usuario compruebe el acierto en su activo antes de creer nada.
 
